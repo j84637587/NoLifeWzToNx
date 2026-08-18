@@ -1,25 +1,123 @@
 # NoLifeWzToNx
-A C++ project to convert WZ files to NX files
 
-# Building
-1. Open **NoLifeWzToNx.sln** in Visual Studio 2019 CE
-2. Make sure to use **Windows SDK Version: 8.1** and **Platform Toolset: v140** (If you don't have these, download them.)
-   * [Windows 8.1 SDK]
-3. Press **Build** > **Build Solution** or **Ctrl + Shift + B**
-4. After a successful build, right-click the **NoLifeWzToNx** project.
-5. Click **Properties**
-6. Make sure under **Configuration** is set to **Debug** and **Platform** is set to **x64**
-7. Click on the **Debugging** tab
-8. Under **Command Argument** type in **$(OutDir)files -c**
-9. You can now run the program by pressing **Debug** > **Start Debugging**, **F5**, or by running **launch.bat** within the root directory.
-10. Make sure all WZ files are present in the files folder before debugging:
-   - Navigate to **x64** > **Debug**
-   - Create a new folder named **files**
-   - Place your WZ files in the **files** folder
+**English** | [繁體中文](README.zh-TW.md)
 
-# Dependencies
-- [libsquish](https://github.com/Cavewhere/squish)
-- [LZ4](https://github.com/lz4/lz4/releases)
-- [zlib](https://github.com/maxirmx/Dist_zlib)
+NoLifeWzToNx is a C++ command-line tool for converting MapleStory WZ files to NX files.
 
-[Windows 8.1 SDK]:   https://developer.microsoft.com/en-us/windows/downloads/sdk-archive
+## Upstream and improvements
+
+This project is an improved and updated version based on [ryantpayton/NoLifeWzToNx](https://github.com/ryantpayton/NoLifeWzToNx).
+
+This version includes:
+
+- A modern CMake-based Windows x64 build.
+- Source-built dependencies pinned with Git submodules.
+- Extended compatibility with newer WZ bitmap formats.
+- A repeatable Debug build helper script.
+
+## Requirements
+
+- [CMake](https://cmake.org/) 3.23 or newer.
+
+## Clone
+
+Clone this repository together with its pinned dependencies:
+
+```bat
+git clone --recurse-submodules https://github.com/j84637587/NoLifeWzToNx
+cd NoLifeWzToNx
+```
+
+If the repository was cloned without `--recurse-submodules`, initialize the dependencies separately:
+
+```bat
+git submodule update --init --recursive
+```
+
+## Build
+
+Configure the project:
+
+```bat
+cmake --preset windows-x64
+```
+
+Build Debug:
+
+```bat
+cmake --build --preset windows-x64-debug
+```
+
+Build Release:
+
+```bat
+cmake --build --preset windows-x64-release
+```
+
+The executables are written to:
+
+```text
+x64\Debug\NoLifeWzToNx.exe
+x64\Release\NoLifeWzToNx.exe
+```
+
+You can also configure and build the Debug executable with the helper script:
+
+```bat
+build-debug.bat
+```
+
+## Run
+
+Run the converter directly and provide a WZ file, IMG file, or directory as an input argument.
+
+Client WZ example:
+
+```bat
+x64\Debug\NoLifeWzToNx.exe "F:\path\to\file.wz" --client
+```
+
+Client directory example:
+
+```bat
+x64\Debug\NoLifeWzToNx.exe "F:\path\to\wz_folder" -c
+```
+
+Server WZ example:
+
+```bat
+x64\Debug\NoLifeWzToNx.exe "F:\path\to\Data.wz" --server
+```
+
+Use high-compression LZ4 output by adding `--lz4hc` or `-h`:
+
+```bat
+x64\Debug\NoLifeWzToNx.exe "F:\path\to\file.wz" -c -h
+```
+
+Command-line options:
+
+| Option | Short form | Description |
+| --- | --- | --- |
+| `--client` | `-c` | Convert client WZ/IMG data, including bitmaps and audio. |
+| `--server` | `-s` | Convert server data without client bitmap and audio output. |
+| `--lz4hc` | `-h` | Use LZ4 high-compression mode for bitmap output. |
+
+At least one input file or directory must be provided. The converter writes each NX file next to its source WZ or IMG file. If the destination NX file already exists, that file is skipped.
+
+## Dependencies
+
+Dependencies are built from source and pinned to exact Git commits:
+
+| Dependency | Version | Commit |
+| --- | --- | --- |
+| [zlib](https://github.com/madler/zlib) | 1.2.11 | `cacf7f1d4e3d44d871b605da3b647f07d718623f` |
+| [LZ4](https://github.com/lz4/lz4) | 1.8.2 | `b3692db46d2b23a7c0af2d5e69988c94f126e10a` |
+| [libsquish](https://github.com/oblivioncth/libsquish) | 1.15.1.4 | `4f48f6752814e3e62e75087fc09b816ac0e1f0f0` |
+| [bcdec](https://github.com/iOrange/bcdec) | 0.97 | `93628fe5627102fe5187b7eeb99122dec6612c36` |
+
+zlib, LZ4, and libsquish are linked statically. No dependency DLLs need to be copied next to the executable.
+
+## License
+
+This project is distributed under the GNU Affero General Public License, version 3 or later, consistent with the upstream project and the license headers in the source files.

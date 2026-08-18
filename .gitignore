@@ -1,6 +1,10 @@
 /.vs
+/build
 /x64
 /x86
+/wz
+/CMakeUserPresets.json
 
 *.log
+*.nx
 *.vcxproj.user

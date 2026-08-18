@@ -1,0 +1,12 @@
+[submodule "third_party/zlib"]
+	path = third_party/zlib
+	url = https://github.com/madler/zlib.git
+[submodule "third_party/lz4"]
+	path = third_party/lz4
+	url = https://github.com/lz4/lz4.git
+[submodule "third_party/libsquish"]
+	path = third_party/libsquish
+	url = https://github.com/oblivioncth/libsquish.git
+[submodule "third_party/bcdec"]
+	path = third_party/bcdec
+	url = https://github.com/iOrange/bcdec.git
