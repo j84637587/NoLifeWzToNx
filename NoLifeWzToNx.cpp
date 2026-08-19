@@ -50,6 +50,7 @@
 #include <array>
 #include <chrono>
 
+#include <limits>
 #ifndef NL_NO_CODECVT
 #include <codecvt>
 #endif
@@ -1027,6 +1028,27 @@ namespace nl {
 
         void write_bitmaps() {
             std::cout << "Writing bitmaps.....";
+            std::error_code cache_error;
+            auto cache_directory = sys::path(wzfilename).parent_path() / ".NoLifeWzToNx.cache";
+            if (!bitmaps.empty()) sys::create_directories(cache_directory, cache_error);
+            auto cache_enabled = !cache_error;
+            if (!cache_enabled) {
+                std::cout << " cache disabled (" << cache_error.message() << ")";
+            }
+
+            auto cache_hits = 0u;
+            auto last_percent = std::numeric_limits<unsigned>::max();
+            auto show_progress = [&](size_t completed) {
+                auto percent = bitmaps.empty()
+                    ? 100u
+                    : static_cast<unsigned>(completed * 100 / bitmaps.size());
+                if (percent == last_percent && completed != bitmaps.size()) return;
+                last_percent = percent;
+                std::cout << '\r' << "Writing bitmaps..... [" << completed << '/' << bitmaps.size()
+                    << "] " << percent << "% | cache hits: " << cache_hits
+                    << " | compressed: " << (completed - cache_hits) << std::flush;
+                };
+            show_progress(0);
             out.seek(bitmap_table_offset);
             std::ofstream file(nxfilename, std::ios::app | std::ios::binary);
             std::vector<uint8_t> input;
@@ -1066,7 +1088,71 @@ namespace nl {
                 input.resize(biggest);
                 output.resize(biggest);
                 auto original = reinterpret_cast<uint8_t const*>(in.offset);
+                auto source_length = length;
                 auto key = b.key;
+                uint64_t hash1 = 14695981039346656037ull;
+                uint64_t hash2 = 1099511628211ull;
+                auto hash_bytes = [&](void const* data, size_t data_size) {
+                    auto bytes = static_cast<uint8_t const*>(data);
+                    for (size_t i = 0; i < data_size; ++i) {
+                        hash1 = (hash1 ^ bytes[i]) * 1099511628211ull;
+                        hash2 = (hash2 ^ bytes[i]) * 14029467366897019727ull;
+                    }
+                    };
+                auto hash_value = [&](auto const& value) { hash_bytes(&value, sizeof(value)); };
+                constexpr uint32_t cache_version = 2;
+                // Increment when bitmap decoding or compression changes the output bytes.
+                auto high_compression = static_cast<uint8_t>(hc);
+                auto key_id = static_cast<uint8_t>(3);
+                for (auto i = 0u; i < std::size(keys); ++i) {
+                    if (key == keys[i]) key_id = static_cast<uint8_t>(i);
+                }
+                hash_value(cache_version);
+                hash_value(high_compression);
+                hash_value(key_id);
+                hash_value(width);
+                hash_value(height);
+                hash_value(format1);
+                hash_value(format2);
+                hash_value(source_length);
+                hash_bytes(original, source_length);
+
+                std::ostringstream cache_name;
+                cache_name << std::hex << std::setfill('0') << std::setw(16) << hash1
+                    << std::setw(16) << hash2 << ".bin";
+                auto cache_path = cache_directory / cache_name.str();
+                auto max_compressed_size = static_cast<uint32_t>(LZ4_compressBound(size));
+                uint32_t final_size = 0;
+                if (cache_enabled) {
+                    std::ifstream cache_file(cache_path, std::ios::binary | std::ios::ate);
+                    if (cache_file) {
+                        auto cache_size = cache_file.tellg();
+                        cache_file.seekg(0);
+                        uint32_t magic = 0;
+                        uint32_t cached_checksum = 0;
+                        cache_file.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+                        cache_file.read(reinterpret_cast<char*>(&final_size), sizeof(final_size));
+                        cache_file.read(reinterpret_cast<char*>(&cached_checksum), sizeof(cached_checksum));
+                        if (magic == 0x32434C4E && final_size > 0
+                            && final_size <= max_compressed_size
+                            && cache_size == static_cast<std::streamoff>(final_size + 12)) {
+                            output.resize(final_size);
+                            cache_file.read(reinterpret_cast<char*>(output.data()), final_size);
+                            auto checksum = crc32(0, Z_NULL, 0);
+                            checksum = crc32(checksum, output.data(), final_size);
+                            if (checksum != cached_checksum) cache_file.setstate(std::ios::failbit);
+                            if (cache_file) {
+                                bitmap_offset += final_size + 4;
+                                file.write(reinterpret_cast<char const*>(&final_size), 4);
+                                file.write(reinterpret_cast<char const*>(output.data()), final_size);
+                                ++cache_hits;
+                                show_progress(index + 1);
+                                continue;
+                            }
+                        }
+                    }
+                }
+
                 auto decompressed = 0;
                 auto decompress = [&] {
                     z_stream strm = {};
@@ -1244,8 +1330,7 @@ namespace nl {
                     throw std::runtime_error("Unknown image type!");
                 }
 
-                output.resize(static_cast<size_t>(LZ4_compressBound(size)));
-                uint32_t final_size;
+                output.resize(max_compressed_size);
                 if (hc) {
                     final_size = static_cast<uint32_t>(
                         LZ4_compressHC(reinterpret_cast<char const*>(input.data()),
@@ -1256,11 +1341,26 @@ namespace nl {
                         LZ4_compress(reinterpret_cast<char const*>(input.data()),
                             reinterpret_cast<char*>(output.data()), size));
                 }
+                if (final_size == 0) throw std::runtime_error("Unable to compress bitmap");
+
+                if (cache_enabled) {
+                    std::ofstream cache_file(cache_path, std::ios::binary | std::ios::trunc);
+                    if (cache_file) {
+                        constexpr uint32_t magic = 0x32434C4E;
+                        auto checksum = crc32(0, Z_NULL, 0);
+                        checksum = crc32(checksum, output.data(), final_size);
+                        cache_file.write(reinterpret_cast<char const*>(&magic), sizeof(magic));
+                        cache_file.write(reinterpret_cast<char const*>(&final_size), sizeof(final_size));
+                        cache_file.write(reinterpret_cast<char const*>(&checksum), sizeof(checksum));
+                        cache_file.write(reinterpret_cast<char const*>(output.data()), final_size);
+                    }
+                }
+                show_progress(index + 1);
                 bitmap_offset += final_size + 4;
                 file.write(reinterpret_cast<char const*>(&final_size), 4);
                 file.write(reinterpret_cast<char const*>(output.data()), final_size);
             }
-            std::cout << "Done!" << std::endl;
+            std::cout << std::endl;
         }
 
         wztonx(sys::path filename, bool client, bool hc) : client(client), hc(hc) {

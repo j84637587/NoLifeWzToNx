@@ -7,4 +7,6 @@
 
 *.log
 *.nx
+*.nx.cache/
+.NoLifeWzToNx.cache/
 *.vcxproj.user
