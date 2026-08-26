@@ -95,6 +95,12 @@ x64\Debug\NoLifeWzToNx.exe "F:\path\to\Data.wz" --server
 x64\Debug\NoLifeWzToNx.exe "F:\path\to\file.wz" -c -h
 ```
 
+bitmap 轉換預設最多使用 8 個 worker threads。可用 `--threads N` 或 `-t N` 指定 1 到 64：
+
+```bat
+x64\Debug\NoLifeWzToNx.exe "F:\path\to\file.wz" -c -h --threads 8
+```
+
 命令列選項：
 
 | 選項 | 簡寫 | 說明 |
@@ -102,10 +108,17 @@ x64\Debug\NoLifeWzToNx.exe "F:\path\to\file.wz" -c -h
 | `--client` | `-c` | 轉換 Client WZ/IMG 資料，包含 bitmap 與 audio。 |
 | `--server` | `-s` | 轉換 Server 資料，不輸出 Client bitmap 與 audio。 |
 | `--lz4hc` | `-h` | bitmap 輸出使用 LZ4 高壓縮模式。 |
+| `--threads N` | `-t N` | 使用 N 個 bitmap worker threads（1-64，預設最多 8）。 |
 
 至少必須提供一個輸入檔案或資料夾。轉換器會將 NX 檔案寫入來源 WZ 或 IMG 檔案所在的資料夾。如果目的 NX 檔案已存在，該檔案會被跳過。
 
 Client bitmap 的壓縮結果會快取在輸入旁共用的 `.NoLifeWzToNx.cache` 目錄。同一資料夾內的 WZ/IMG 即使檔名不同，也能重用未變更 bitmap 的 LZ4 資料。bitmap 進度列會顯示完成數、百分比、快取命中數與本次實際壓縮數；bitmap 內容、壓縮模式或格式變更時會自動使用不同的快取項目。
+
+## NX raw binary 擴充
+
+WZ 的 `RawData` 與 `Canvas#Video` payload 會逐位元組複製到 NX，包含具有子屬性或長度為零的 payload；client 與 server 輸出都會保留 raw binary。
+
+此擴充維持 `PKG4` header 與既有 20-byte node layout。Header offset 52 是 raw entry 數量（`uint32`），offset 56 是 raw offset table 位置（`uint64`）。Node type 8 代表 raw binary，其 8-byte data field 依序存放 raw entry ID 與 payload length（兩者皆為 `uint32`）；raw offset table 的每筆資料是 payload 的絕對檔案位置（`uint64`）。不含 raw entry 的檔案，其 header byte 52 到 63 維持全零。
 
 ## 相依套件
 

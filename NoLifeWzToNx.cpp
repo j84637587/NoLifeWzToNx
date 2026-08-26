@@ -49,8 +49,11 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <condition_variable>
+#include <exception>
 
 #include <limits>
+#include <mutex>
 #ifndef NL_NO_CODECVT
 #include <codecvt>
 #endif
@@ -69,6 +72,8 @@ namespace sys = std::filesystem;
 #include <numeric>
 #include <regex>
 #include <string>
+#include <optional>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 #include <sstream>
@@ -188,6 +193,7 @@ namespace nl {
     struct imapfile {
         char const* base = nullptr;
         char const* offset = nullptr;
+        size_t file_size = 0;
 #ifdef _WIN32
         void* file_handle = nullptr;
         void* map_handle = nullptr;
@@ -196,6 +202,10 @@ namespace nl {
                 FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
             if (file_handle == INVALID_HANDLE_VALUE)
                 throw std::runtime_error("Failed to open file " + p);
+            LARGE_INTEGER size;
+            if (!GetFileSizeEx(file_handle, &size) || size.QuadPart < 0)
+                throw std::runtime_error("Failed to obtain file information of file " + p);
+            file_size = static_cast<size_t>(size.QuadPart);
             map_handle = CreateFileMappingA(file_handle, nullptr, PAGE_READONLY, 0, 0, nullptr);
             if (map_handle == nullptr)
                 throw std::runtime_error("Failed to create file mapping of file " + p);
@@ -210,7 +220,6 @@ namespace nl {
         }
 #else
         int file_handle = 0;
-        size_t file_size = 0;
         void open(std::string p) {
             file_handle = ::open(p.c_str(), O_RDONLY);
             if (file_handle == -1) throw std::runtime_error("Failed to open file " + p);
@@ -316,7 +325,8 @@ namespace nl {
             vector = 4,
             bitmap = 5,
             audio = 6,
-            uol = 7
+            uol = 7,
+            raw = 8
         };
         uint32_t name = 0;
         uint32_t children = 0;
@@ -336,6 +346,10 @@ namespace nl {
                 uint32_t id;
                 uint32_t length;
             } audio;
+            struct _raw {
+                uint32_t id;
+                uint32_t length;
+            } raw;
         } data;
     };
 #pragma pack(pop)
@@ -346,6 +360,10 @@ namespace nl {
     struct bitmap {
         uint64_t data;
         uint8_t const* key;
+    };
+    struct raw_binary {
+        uint32_t length;
+        uint64_t data;
     };
     // The main class itself
     struct wztonx {
@@ -371,10 +389,13 @@ namespace nl {
         std::vector<std::vector<id_t>> links;
         std::vector<bitmap> bitmaps;
         std::vector<audio> audios;
+        std::vector<raw_binary> raw_binaries;
+        size_t current_image_end = 0;
         size_t offset, node_offset, string_offset, string_table_offset, bitmap_offset,
-            bitmap_table_offset, audio_offset, audio_table_offset;
+            bitmap_table_offset, audio_offset, audio_table_offset, raw_offset, raw_table_offset;
         bool client, hc;
         std::string wzfilename, nxfilename;
+        unsigned threads;
         bool skip = false;
         // Methods
         std::string convert_str(std::u16string const& p_str) {
@@ -746,6 +767,48 @@ namespace nl {
                 a.data = in.tell();
                 audios.push_back(a);
             }
+            else if (st == "RawData" || st == "Canvas#Video") {
+                auto ensure_available = [&](size_t length) {
+                    auto position = in.tell();
+                    if (position > current_image_end || length > current_image_end - position)
+                        throw std::runtime_error(st + " exceeds its containing image");
+                    };
+                auto read_bounded_cint = [&] {
+                    ensure_available(1);
+                    auto value = in.read<int8_t>();
+                    if (value != -128) return static_cast<int32_t>(value);
+                    ensure_available(sizeof(int32_t));
+                    return in.read<int32_t>();
+                    };
+
+                ensure_available(1);
+                auto has_property_flag = st == "Canvas#Video" || in.read<uint8_t>() == 1;
+                if (st == "Canvas#Video") in.skip(1);
+                if (has_property_flag) {
+                    ensure_available(1);
+                    if (in.read<uint8_t>() == 1) {
+                        ensure_available(2);
+                        in.skip(2);
+                        sub_property(prop_node, p_offset);
+                    }
+                }
+                if (st == "Canvas#Video") {
+                    ensure_available(1);
+                    in.skip(1);
+                }
+                auto length = read_bounded_cint();
+                if (length < 0) throw std::runtime_error(st + " has a negative length");
+                ensure_available(static_cast<size_t>(length));
+                if (raw_binaries.size() >= std::numeric_limits<uint32_t>::max())
+                    throw std::runtime_error("NX raw binary table is too large");
+
+                auto& nn = nodes[prop_node];
+                nn.data_type = node::type::raw;
+                nn.data.raw.id = static_cast<uint32_t>(raw_binaries.size());
+                nn.data.raw.length = static_cast<uint32_t>(length);
+                raw_binaries.push_back({ static_cast<uint32_t>(length), in.tell() });
+                in.skip(static_cast<size_t>(length));
+            }
             else if (st == "UOL") {
                 in.skip(1);
                 n.data_type = node::type::uol;
@@ -824,8 +887,11 @@ namespace nl {
          * \param a
          * \param a
          */
-        void img(id_t img_node, int32_t size) {
+        void img(id_t img_node, size_t size) {
             auto p = in.tell();
+            if (p > in.file_size || size > in.file_size - p)
+                throw std::runtime_error("Image exceeds its containing file");
+            current_image_end = p + size;
             auto n1 = in.read<uint8_t>();
             if (n1 == 1) {
                 lua_script(img_node);
@@ -835,7 +901,7 @@ namespace nl {
                 in.seek(p);
                 extended_property(img_node, p);
             }
-            in.seek(p + size);
+            in.seek(current_image_end);
         }
         void lua_script(id_t script_node) {
             auto slen = static_cast<uint32_t>(in.read_cint());
@@ -958,10 +1024,25 @@ namespace nl {
                 offset += bitmaps.size() * 8;
                 offset += 0x10 - (offset & 0xf);
             }
+            raw_table_offset = 0;
+            if (!raw_binaries.empty()) {
+                raw_table_offset = offset;
+                offset += raw_binaries.size() * 8;
+                offset += 0x10 - (offset & 0xf);
+            }
             audio_offset = offset;
             if (client) {
                 offset += std::accumulate(audios.begin(), audios.end(), 0ull,
                     [](size_t n, audio const& a) { return n + a.length; });
+                offset += 0x10 - (offset & 0xf);
+            }
+            raw_offset = offset;
+            if (!raw_binaries.empty()) {
+                for (auto const& raw : raw_binaries) {
+                    if (raw.length > std::numeric_limits<size_t>::max() - offset)
+                        throw std::runtime_error("NX raw binary data is too large");
+                    offset += raw.length;
+                }
                 offset += 0x10 - (offset & 0xf);
             }
             bitmap_offset = offset;
@@ -988,6 +1069,8 @@ namespace nl {
                 out.write<uint32_t>(0);
                 out.write<uint64_t>(0);
             }
+            out.write<uint32_t>(static_cast<uint32_t>(raw_binaries.size()));
+            out.write<uint64_t>(raw_binaries.empty() ? 0 : raw_table_offset);
             std::cout << "Done!" << std::endl;
         }
         void write_nodes() {
@@ -1013,6 +1096,20 @@ namespace nl {
             }
             std::cout << "Done!" << std::endl;
         }
+        void write_raw_binaries() {
+            if (raw_binaries.empty()) return;
+            std::cout << "Writing raw data....";
+            out.seek(raw_table_offset);
+            auto raw_data_offset = raw_offset;
+            for (auto const& raw : raw_binaries) {
+                out.write<uint64_t>(raw_data_offset);
+                raw_data_offset += raw.length;
+            }
+            out.seek(raw_offset);
+            for (auto const& raw : raw_binaries)
+                out.write(in.base + raw.data, raw.length);
+            std::cout << "Done!" << std::endl;
+        }
         void write_audio() {
             std::cout << "Writing audio.......";
             out.seek(audio_table_offset);
@@ -1027,6 +1124,26 @@ namespace nl {
         }
 
         void write_bitmaps() {
+            struct bitmap_job {
+                size_t index;
+                int width;
+                int height;
+                int format1;
+                unsigned format2;
+                int size;
+                uint32_t length;
+                uint8_t const* original;
+                uint8_t const* key;
+                uint32_t max_compressed_size;
+                sys::path cache_path;
+            };
+            struct bitmap_result {
+                std::vector<uint8_t> compressed;
+                std::string diagnostics;
+                std::exception_ptr error;
+                bool cache_hit = false;
+            };
+
             std::cout << "Writing bitmaps.....";
             std::error_code cache_error;
             auto cache_directory = sys::path(wzfilename).parent_path() / ".NoLifeWzToNx.cache";
@@ -1036,59 +1153,41 @@ namespace nl {
                 std::cout << " cache disabled (" << cache_error.message() << ")";
             }
 
-            auto cache_hits = 0u;
-            auto last_percent = std::numeric_limits<unsigned>::max();
-            auto show_progress = [&](size_t completed) {
-                auto percent = bitmaps.empty()
-                    ? 100u
-                    : static_cast<unsigned>(completed * 100 / bitmaps.size());
-                if (percent == last_percent && completed != bitmaps.size()) return;
-                last_percent = percent;
-                std::cout << '\r' << "Writing bitmaps..... [" << completed << '/' << bitmaps.size()
-                    << "] " << percent << "% | cache hits: " << cache_hits
-                    << " | compressed: " << (completed - cache_hits) << std::flush;
-                };
-            show_progress(0);
-            out.seek(bitmap_table_offset);
-            std::ofstream file(nxfilename, std::ios::app | std::ios::binary);
-            std::vector<uint8_t> input;
-            std::vector<uint8_t> output;
-
+            std::vector<bitmap_job> jobs;
+            jobs.reserve(bitmaps.size());
+            auto last_index_percent = std::numeric_limits<unsigned>::max();
             for (auto index = 0u; index < bitmaps.size(); ++index) {
                 auto& b = bitmaps[index];
-                out.write<uint64_t>(bitmap_offset);
                 in.seek(b.data);
                 auto width = in.read_cint();
                 auto height = in.read_cint();
                 if (width < 0 || height < 0) {
-                    std::cout << "Invalid image size: " << std::dec << width << ", " << height << std::endl;
-                    throw std::runtime_error{ "fak" };
+                    std::cout << "Invalid image size: " << std::dec << width << ", " << height
+                        << std::endl;
+                    throw std::runtime_error{ "Invalid image size" };
+                }
+                auto pixel_count = static_cast<uint64_t>(width) * static_cast<uint64_t>(height);
+                if (pixel_count > static_cast<uint64_t>(std::numeric_limits<int>::max()) / 4) {
+                    throw std::runtime_error{ "Bitmap is too large" };
                 }
                 auto format1 = in.read_cint();
-                auto format2 = static_cast<unsigned>(in.read<uint8_t>()); // Cast away from char to preserve sanity
-                // 不知道是什麼但應該不能為 0
+                auto format2 = static_cast<unsigned>(in.read<uint8_t>());
                 auto n1 = in.read<uint32_t>();
                 if (n1) {
                     std::cout << "non-zero n1: "
                         << "0x" << std::setfill('0') << std::setw(8) << std::hex << n1;
-                    throw std::runtime_error{ "fak" };
+                    throw std::runtime_error{ "Invalid bitmap header" };
                 }
                 auto length = in.read<uint32_t>();
-                // 不知道是什麼但應該不能為 0
                 auto n2 = static_cast<unsigned>(in.read<uint8_t>());
                 if (n2) {
                     std::cout << "non-zero n2: "
                         << " 0x" << std::setfill('0') << std::setw(2) << std::hex
                         << n2 << std::endl;
-                    throw std::runtime_error{ "fak" };
+                    throw std::runtime_error{ "Invalid bitmap header" };
                 }
 
-                auto size = width * height * 4;
-                auto biggest = std::max(static_cast<uint32_t>(size), length);
-                input.resize(biggest);
-                output.resize(biggest);
                 auto original = reinterpret_cast<uint8_t const*>(in.offset);
-                auto source_length = length;
                 auto key = b.key;
                 uint64_t hash1 = 14695981039346656037ull;
                 uint64_t hash2 = 1099511628211ull;
@@ -1100,8 +1199,7 @@ namespace nl {
                     }
                     };
                 auto hash_value = [&](auto const& value) { hash_bytes(&value, sizeof(value)); };
-                constexpr uint32_t cache_version = 2;
-                // Increment when bitmap decoding or compression changes the output bytes.
+                constexpr uint32_t cache_version = 4;
                 auto high_compression = static_cast<uint8_t>(hc);
                 auto key_id = static_cast<uint8_t>(3);
                 for (auto i = 0u; i < std::size(keys); ++i) {
@@ -1114,94 +1212,152 @@ namespace nl {
                 hash_value(height);
                 hash_value(format1);
                 hash_value(format2);
-                hash_value(source_length);
-                hash_bytes(original, source_length);
+                hash_value(length);
+                hash_bytes(original, length);
 
                 std::ostringstream cache_name;
                 cache_name << std::hex << std::setfill('0') << std::setw(16) << hash1
                     << std::setw(16) << hash2 << ".bin";
-                auto cache_path = cache_directory / cache_name.str();
-                auto max_compressed_size = static_cast<uint32_t>(LZ4_compressBound(size));
-                uint32_t final_size = 0;
+                auto size = static_cast<int>(pixel_count * 4);
+                jobs.push_back({
+                    index,
+                    width,
+                    height,
+                    format1,
+                    format2,
+                    size,
+                    length,
+                    original,
+                    key,
+                    static_cast<uint32_t>(LZ4_compressBound(size)),
+                    cache_directory / cache_name.str()
+                    });
+                auto index_percent = static_cast<unsigned>((index + 1) * 100 / bitmaps.size());
+                if (index_percent != last_index_percent || index + 1 == bitmaps.size()) {
+                    last_index_percent = index_percent;
+                    std::cout << '\r' << "Indexing bitmaps.... [" << (index + 1) << '/'
+                        << bitmaps.size() << "] " << index_percent << "%" << std::flush;
+                }
+            }
+
+            auto process_bitmap = [&](bitmap_job const& job) {
+                bitmap_result result;
                 if (cache_enabled) {
-                    std::ifstream cache_file(cache_path, std::ios::binary | std::ios::ate);
+                    std::ifstream cache_file(job.cache_path, std::ios::binary | std::ios::ate);
                     if (cache_file) {
                         auto cache_size = cache_file.tellg();
                         cache_file.seekg(0);
                         uint32_t magic = 0;
+                        uint32_t final_size = 0;
                         uint32_t cached_checksum = 0;
                         cache_file.read(reinterpret_cast<char*>(&magic), sizeof(magic));
                         cache_file.read(reinterpret_cast<char*>(&final_size), sizeof(final_size));
                         cache_file.read(reinterpret_cast<char*>(&cached_checksum), sizeof(cached_checksum));
                         if (magic == 0x32434C4E && final_size > 0
-                            && final_size <= max_compressed_size
+                            && final_size <= job.max_compressed_size
                             && cache_size == static_cast<std::streamoff>(final_size + 12)) {
-                            output.resize(final_size);
-                            cache_file.read(reinterpret_cast<char*>(output.data()), final_size);
+                            result.compressed.resize(final_size);
+                            cache_file.read(reinterpret_cast<char*>(result.compressed.data()), final_size);
                             auto checksum = crc32(0, Z_NULL, 0);
-                            checksum = crc32(checksum, output.data(), final_size);
-                            if (checksum != cached_checksum) cache_file.setstate(std::ios::failbit);
-                            if (cache_file) {
-                                bitmap_offset += final_size + 4;
-                                file.write(reinterpret_cast<char const*>(&final_size), 4);
-                                file.write(reinterpret_cast<char const*>(output.data()), final_size);
-                                ++cache_hits;
-                                show_progress(index + 1);
-                                continue;
+                            checksum = crc32(checksum, result.compressed.data(), final_size);
+                            if (cache_file && checksum == cached_checksum) {
+                                result.cache_hit = true;
+                                return result;
                             }
+                            result.compressed.clear();
                         }
                     }
                 }
 
+                auto width = job.width;
+                auto height = job.height;
+                auto format1 = job.format1;
+                auto format2 = job.format2;
+                auto length = job.length;
+                auto format = format1 + (format2 << 8);
+                auto pixels = width * height;
+                size_t expected;
+                switch (format) {
+                case 1:
+                case 257:
+                case 513:
+                    expected = static_cast<size_t>(pixels) * 2;
+                    break;
+                case 2:
+                case 2562:
+                    expected = static_cast<size_t>(pixels) * 4;
+                    break;
+                case 1026:
+                case 2050:
+                case 4098:
+                    expected = block16_data_size(width, height);
+                    break;
+                default:
+                    throw std::runtime_error("Unknown image format: " + std::to_string(format));
+                }
+                auto biggest = std::max(static_cast<uint32_t>(job.size), length);
+                std::vector<uint8_t> input(biggest);
+                std::vector<uint8_t> output(biggest);
+                std::ostringstream diagnostics;
                 auto decompressed = 0;
                 auto decompress = [&] {
                     z_stream strm = {};
                     strm.next_in = input.data();
                     strm.avail_in = length;
-                    inflateInit(&strm);
-                    strm.next_out = output.data();
-                    strm.avail_out = static_cast<unsigned>(output.size());
-                    auto err = inflate(&strm, Z_FINISH);
-                    if (err != Z_BUF_ERROR) {
-                        if (err != Z_DATA_ERROR) { std::cout << "zlib error of " << std::dec << err << std::endl; }
+                    auto init_status = inflateInit(&strm);
+                    if (init_status != Z_OK) {
+                        diagnostics << "zlib init error of " << std::dec << init_status << std::endl;
                         return false;
                     }
+                    strm.next_out = output.data();
+                    strm.avail_out = static_cast<unsigned>(expected);
+                    auto err = inflate(&strm, Z_FINISH);
                     decompressed = static_cast<int>(strm.total_out);
                     inflateEnd(&strm);
+                    if (static_cast<size_t>(decompressed) != expected
+                        || (err != Z_STREAM_END && err != Z_BUF_ERROR)) {
+                        if (err != Z_DATA_ERROR)
+                            diagnostics << "zlib error of " << std::dec << err << std::endl;
+                        return false;
+                    }
                     return true;
                     };
                 auto decrypt = [&] {
-                    auto p = 0u;
-                    for (auto i = 0u; i <= length - 4;) {
-                        auto blen = *reinterpret_cast<uint32_t const*>(original + i);
-                        i += 4;
-                        if (i + blen > length) return false;
-                        for (auto j = 0u; j < blen; ++j)
-                            input[p + j] = static_cast<uint8_t>(original[i + j] ^ key[j]);
-                        i += blen;
-                        p += blen;
+                    if (length < 4) return false;
+                    auto output_offset = 0u;
+                    for (auto input_offset = 0u; input_offset <= length - 4;) {
+                        auto block_length =
+                            *reinterpret_cast<uint32_t const*>(job.original + input_offset);
+                        input_offset += 4;
+                        if (block_length > length - input_offset
+                            || block_length > input.size() - output_offset) {
+                            return false;
+                        }
+                        for (auto j = 0u; j < block_length; ++j)
+                            input[output_offset + j]
+                                = static_cast<uint8_t>(job.original[input_offset + j] ^ job.key[j]);
+                        input_offset += block_length;
+                        output_offset += block_length;
                     }
-                    length = p;
+                    length = output_offset;
                     return true;
                     };
 
-                // 複製 wz 資料到 input
-                std::copy(original, original + length, input.begin());
+                std::copy(job.original, job.original + length, input.begin());
                 if (!decompress() && (!decrypt() || !decompress())) {
-                    std::cout << "Unable to inflate: 0x" << std::setfill('0') << std::setw(2)
-                        << std::hex << (unsigned)original[0] << " 0x" << std::setfill('0')
-                        << std::setw(2) << std::hex << static_cast<unsigned>(original[1])
+                    auto first = job.length > 0 ? static_cast<unsigned>(job.original[0]) : 0;
+                    auto second = job.length > 1 ? static_cast<unsigned>(job.original[1]) : 0;
+                    diagnostics << "Unable to inflate: 0x" << std::setfill('0') << std::setw(2)
+                        << std::hex << first << " 0x" << std::setw(2) << second << std::dec
                         << std::endl;
-                    // Just fill the image with blank data so nothing breaks
                     format1 = 2;
                     format2 = 0;
-                    decompressed = size;
-                    std::fill(output.begin(), output.begin() + size, '\0');
+                    format = 2;
+                    expected = static_cast<size_t>(job.size);
+                    decompressed = job.size;
+                    std::fill(output.begin(), output.begin() + job.size, '\0');
                 }
                 input.swap(output);
-
-                auto is_dxt5 = format1 == 2 && format2 == 8;
-                auto is_bc7 = format1 == 2 && format2 == 16;
 
                 struct color4444 {
                     uint8_t b : 4;
@@ -1226,55 +1382,16 @@ namespace nl {
                 };
                 static_assert(sizeof(color565) == 2, "Your bitpacking sucks");
 
-                // 複製資料
                 auto pixels4444 = reinterpret_cast<color4444*>(input.data());
                 auto pixels8888 = reinterpret_cast<color8888*>(input.data());
                 auto pixels565 = reinterpret_cast<color565*>(input.data());
                 auto pixelsout = reinterpret_cast<color8888*>(output.data());
-
-                //Sanity check the sizes
-                auto check = decompressed;
-                switch (format1) {
-                case 1: check *= 2; break;
-                case 2: break;
-                case 257: check *= 2; break; // Not sure if this is accurate
-                case 513: check *= 2; break;
-                case 1026: check *= 4; break;
-                case 2050: check *= 4; break;
-                default:
-                    std::cout << "Unknown image format1 of" << std::dec << format1 << std::endl;
-                    throw std::runtime_error("Unknown image type!");
+                if (static_cast<size_t>(decompressed) != expected) {
+                    diagnostics << "Size mismatch: " << std::dec << width << "," << height << ","
+                        << decompressed << "," << format << std::endl;
                 }
 
-                auto pixels = width * height;
-
-                switch (format2) {
-                case 0: break;
-                case 4: pixels /= 256; break;
-                case 8:
-                    if (!is_dxt5) {
-                        std::cout << "Unknown image format2 of" << std::dec << format2 << std::endl;
-                        throw std::runtime_error("Unknown image type!");
-                    }
-                    break;
-                case 16:
-                    if (!is_bc7) {
-                        std::cout << "Unknown image format2 of" << std::dec << format2 << std::endl;
-                        throw std::runtime_error("Unknown image type!");
-                    }
-                    break;
-                default:
-                    std::cout << "Unknown image format2 of" << std::dec << static_cast<unsigned>(format2) << std::endl;
-                    throw std::runtime_error("Unknown image type!");
-                }
-
-                auto expected = (is_dxt5 || is_bc7) ? block16_data_size(width, height) : static_cast<size_t>(pixels) * 4;
-                if (static_cast<size_t>(check) != expected) {
-                    std::cout << "Size mismatch: " << std::dec << width << "," << height << "," << decompressed << "," << format1 << "," << format2 << std::endl;
-                    // throw std::runtime_error("help!");
-                }
-
-                switch (format1) {
+                switch (format) {
                 case 1:
                     for (auto i = 0; i < pixels; ++i) {
                         auto p = pixels4444[i];
@@ -1283,19 +1400,13 @@ namespace nl {
                     input.swap(output);
                     break;
                 case 2:
-                    if (is_bc7) {
-                        decode_bc7(input, output, width, height);
-                    }
-                    else if (is_dxt5) {
-                        squish::DecompressImage(output.data(), width, height, input.data(), squish::kDxt5);
-                    }
-                    else {
-                        for (auto i = 0; i < pixels; ++i) {
-                            auto& p = pixels8888[i];
-                            pixelsout[i] = { p.b, p.g, p.r, p.a };
-                        }
+                    for (auto i = 0; i < pixels; ++i) {
+                        auto& p = pixels8888[i];
+                        pixelsout[i] = { p.b, p.g, p.r, p.a };
                     }
                     input.swap(output);
+                    break;
+                case 257:
                     break;
                 case 513:
                     for (auto i = 0; i < pixels; ++i) {
@@ -1305,65 +1416,190 @@ namespace nl {
                     input.swap(output);
                     break;
                 case 1026:
-                    squish::DecompressImage(output.data(), width, height, input.data(), squish::kDxt3);
+                    squish::DecompressImage(
+                        output.data(), width, height, input.data(), squish::kDxt3);
                     input.swap(output);
                     break;
                 case 2050:
-                    squish::DecompressImage(output.data(), width, height, input.data(), squish::kDxt5);
+                    squish::DecompressImage(
+                        output.data(), width, height, input.data(), squish::kDxt5);
                     input.swap(output);
                     break;
-                }
-                switch (format2) {
-                case 0:
-                    // Do nothing
-                    break;
-                case 4:
-                    std::cout << "Format2 of 4 at " << std::dec << index << std::endl;
-                    scale<16>(input, output, width, height);
+                case 2562:
+                    for (auto i = 0; i < pixels; ++i) {
+                        uint32_t p;
+                        std::memcpy(&p, input.data() + static_cast<size_t>(i) * 4, sizeof(p));
+                        pixelsout[i] = {
+                            static_cast<uint8_t>(((p >> 20) & 0x3ff) >> 2),
+                            static_cast<uint8_t>(((p >> 10) & 0x3ff) >> 2),
+                            static_cast<uint8_t>((p & 0x3ff) >> 2),
+                            static_cast<uint8_t>(((p >> 30) & 0x03) * 85)
+                            };
+                    }
                     input.swap(output);
                     break;
-                case 8:
-                case 16:
+                case 4098:
+                    decode_bc7(input, output, width, height);
+                    input.swap(output);
                     break;
-                default:
-                    //std::cerr << "Unknown image format2 of" << std::dec << static_cast<unsigned>(f2) << std::endl;
-                    throw std::runtime_error("Unknown image type!");
                 }
 
-                output.resize(max_compressed_size);
+                output.resize(job.max_compressed_size);
+                uint32_t final_size;
                 if (hc) {
                     final_size = static_cast<uint32_t>(
                         LZ4_compressHC(reinterpret_cast<char const*>(input.data()),
-                            reinterpret_cast<char*>(output.data()), size));
+                            reinterpret_cast<char*>(output.data()), job.size));
                 }
                 else {
                     final_size = static_cast<uint32_t>(
                         LZ4_compress(reinterpret_cast<char const*>(input.data()),
-                            reinterpret_cast<char*>(output.data()), size));
+                            reinterpret_cast<char*>(output.data()), job.size));
                 }
                 if (final_size == 0) throw std::runtime_error("Unable to compress bitmap");
+                output.resize(final_size);
+                result.compressed = std::move(output);
+                result.diagnostics = diagnostics.str();
+                return result;
+                };
 
-                if (cache_enabled) {
-                    std::ofstream cache_file(cache_path, std::ios::binary | std::ios::trunc);
+            auto worker_count = std::min<size_t>(threads, std::max<size_t>(jobs.size(), 1));
+            auto cache_hits = 0u;
+            auto last_percent = std::numeric_limits<unsigned>::max();
+            auto show_progress = [&](size_t completed) {
+                auto percent = bitmaps.empty()
+                    ? 100u
+                    : static_cast<unsigned>(completed * 100 / bitmaps.size());
+                if (percent == last_percent && completed != bitmaps.size()) return;
+                last_percent = percent;
+                std::cout << '\r' << "Writing bitmaps..... [" << completed << '/' << bitmaps.size()
+                    << "] " << percent << "% | threads: " << worker_count
+                    << " | cache hits: " << cache_hits
+                    << " | compressed: " << (completed - cache_hits) << std::flush;
+                };
+
+            out.seek(bitmap_table_offset);
+            std::ofstream file(nxfilename, std::ios::app | std::ios::binary);
+            auto write_result = [&](size_t index, bitmap_result& result) {
+                if (!result.diagnostics.empty()) {
+                    std::cout << '\r' << std::string(120, ' ') << '\r' << result.diagnostics;
+                    last_percent = std::numeric_limits<unsigned>::max();
+                }
+                auto final_size = static_cast<uint32_t>(result.compressed.size());
+                if (!result.cache_hit && cache_enabled) {
+                    std::ofstream cache_file(
+                        jobs[index].cache_path, std::ios::binary | std::ios::trunc);
                     if (cache_file) {
                         constexpr uint32_t magic = 0x32434C4E;
                         auto checksum = crc32(0, Z_NULL, 0);
-                        checksum = crc32(checksum, output.data(), final_size);
+                        checksum = crc32(checksum, result.compressed.data(), final_size);
                         cache_file.write(reinterpret_cast<char const*>(&magic), sizeof(magic));
                         cache_file.write(reinterpret_cast<char const*>(&final_size), sizeof(final_size));
                         cache_file.write(reinterpret_cast<char const*>(&checksum), sizeof(checksum));
-                        cache_file.write(reinterpret_cast<char const*>(output.data()), final_size);
+                        cache_file.write(
+                            reinterpret_cast<char const*>(result.compressed.data()), final_size);
                     }
                 }
-                show_progress(index + 1);
+                out.write<uint64_t>(bitmap_offset);
                 bitmap_offset += final_size + 4;
                 file.write(reinterpret_cast<char const*>(&final_size), 4);
-                file.write(reinterpret_cast<char const*>(output.data()), final_size);
+                file.write(reinterpret_cast<char const*>(result.compressed.data()), final_size);
+                if (result.cache_hit) ++cache_hits;
+                show_progress(index + 1);
+                };
+
+            show_progress(0);
+            if (worker_count == 1) {
+                for (auto index = 0u; index < jobs.size(); ++index) {
+                    auto result = process_bitmap(jobs[index]);
+                    write_result(index, result);
+                }
+            }
+            else {
+                struct result_slot {
+                    size_t index = std::numeric_limits<size_t>::max();
+                    std::optional<bitmap_result> result;
+                };
+                std::vector<result_slot> slots(worker_count);
+                std::mutex pipeline_mutex;
+                std::condition_variable pipeline_ready;
+                size_t next_job = 0;
+                size_t next_write = 0;
+                bool stop = false;
+
+                auto worker = [&] {
+                    for (;;) {
+                        size_t index;
+                        {
+                            std::unique_lock<std::mutex> lock(pipeline_mutex);
+                            pipeline_ready.wait(lock, [&] {
+                                return stop || next_job >= jobs.size()
+                                    || next_job < next_write + slots.size();
+                                });
+                            if (stop || next_job >= jobs.size()) return;
+                            index = next_job++;
+                        }
+
+                        bitmap_result result;
+                        try {
+                            result = process_bitmap(jobs[index]);
+                        }
+                        catch (...) {
+                            result.error = std::current_exception();
+                        }
+                        {
+                            std::lock_guard<std::mutex> lock(pipeline_mutex);
+                            auto& slot = slots[index % slots.size()];
+                            slot.index = index;
+                            slot.result = std::move(result);
+                        }
+                        pipeline_ready.notify_all();
+                    }
+                    };
+
+                std::vector<std::thread> workers;
+                workers.reserve(worker_count);
+                auto stop_and_join = [&] {
+                    {
+                        std::lock_guard<std::mutex> lock(pipeline_mutex);
+                        stop = true;
+                    }
+                    pipeline_ready.notify_all();
+                    for (auto& thread : workers) {
+                        if (thread.joinable()) thread.join();
+                    }
+                    };
+
+                try {
+                    for (auto i = 0u; i < worker_count; ++i) workers.emplace_back(worker);
+                    for (auto index = 0u; index < jobs.size(); ++index) {
+                        bitmap_result result;
+                        {
+                            std::unique_lock<std::mutex> lock(pipeline_mutex);
+                            pipeline_ready.wait(lock, [&] {
+                                auto& slot = slots[index % slots.size()];
+                                return slot.result.has_value() && slot.index == index;
+                                });
+                            auto& slot = slots[index % slots.size()];
+                            result = std::move(*slot.result);
+                            slot.result.reset();
+                            next_write = index + 1;
+                        }
+                        pipeline_ready.notify_all();
+                        if (result.error) std::rethrow_exception(result.error);
+                        write_result(index, result);
+                    }
+                    stop_and_join();
+                }
+                catch (...) {
+                    stop_and_join();
+                    throw;
+                }
             }
             std::cout << std::endl;
         }
-
-        wztonx(sys::path filename, bool client, bool hc) : client(client), hc(hc) {
+        wztonx(sys::path filename, bool client, bool hc, unsigned threads)
+            : client(client), hc(hc), threads(threads) {
             wzfilename = u8string(filename);
             nxfilename = u8string(filename.replace_extension(".nx"));
             if (!std::ifstream{ wzfilename }.is_open()) { return; }
@@ -1380,6 +1616,7 @@ namespace nl {
             open_output();
             write_nodes();
             write_strings();
+            write_raw_binaries();
             if (client) {
                 write_audio();
                 write_bitmaps();
@@ -1388,12 +1625,13 @@ namespace nl {
     };
 
     struct imgtonx : wztonx {
-        imgtonx(sys::path filename, bool client, bool hc) : wztonx{ filename, client, hc } {}
+        imgtonx(sys::path filename, bool client, bool hc, unsigned threads)
+            : wztonx{ filename, client, hc, threads } {}
         void parse_file() override {
             std::cout << "Parsing input.......";
             in.open(wzfilename);
             add_string({});
-            img(0, 0);
+            img(0, in.file_size);
             finish_parse();
         }
     };
@@ -1418,10 +1656,13 @@ Converts WZ files into NX files
     enum { client, server, none } type{ none };
     bool hc{ false };
     std::vector<sys::path> paths;
+    auto hardware_threads = std::thread::hardware_concurrency();
+    unsigned threads = std::min(hardware_threads ? hardware_threads : 1u, 8u);
     std::regex reg1{ "--([a-z]+)" };
     std::regex reg2{ "-([a-z]+)" };
-    for (auto& arg : args) {
-        if (arg[0] != '-') {
+    for (auto arg_index = 0u; arg_index < args.size(); ++arg_index) {
+        auto& arg = args[arg_index];
+        if (arg.empty() || arg[0] != '-') {
             paths.emplace_back(arg);
             continue;
         }
@@ -1435,14 +1676,32 @@ Converts WZ files into NX files
             type = server;
         }
         else if (arg == "--lz4hc" || arg == "-h") { hc = true; }
+        else if (arg == "--threads" || arg == "-t") {
+            if (++arg_index >= args.size()
+                || args[arg_index].empty()
+                || args[arg_index].size() > 2
+                || std::any_of(args[arg_index].begin(), args[arg_index].end(),
+                    [](char c) { return c < '0' || c > '9'; })) {
+                std::cerr << "Invalid thread count. Use --threads N with N from 1 to 64."
+                    << std::endl;
+                return 1;
+            }
+            auto parsed_threads = std::stoul(args[arg_index]);
+            if (parsed_threads == 0 || parsed_threads > 64) {
+                std::cerr << "Invalid thread count. Use --threads N with N from 1 to 64."
+                    << std::endl;
+                return 1;
+            }
+            threads = static_cast<unsigned>(parsed_threads);
+        }
     }
 
     auto convert = [&](sys::path const& p) {
         if (u8string(p.extension()) == ".img") {
-            nl::imgtonx{ p, type == client, hc }.convert_file();
+            nl::imgtonx{ p, type == client, hc, threads }.convert_file();
         }
         else if (u8string(p.extension()) == ".wz") {
-            nl::wztonx{ p, type == client, hc }.convert_file();
+            nl::wztonx{ p, type == client, hc, threads }.convert_file();
         }
     };
 

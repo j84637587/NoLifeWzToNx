@@ -95,6 +95,12 @@ Use high-compression LZ4 output by adding `--lz4hc` or `-h`:
 x64\Debug\NoLifeWzToNx.exe "F:\path\to\file.wz" -c -h
 ```
 
+Bitmap conversion uses up to 8 worker threads by default. Use `--threads N` or `-t N` to choose between 1 and 64 workers:
+
+```bat
+x64\Debug\NoLifeWzToNx.exe "F:\path\to\file.wz" -c -h --threads 8
+```
+
 Command-line options:
 
 | Option | Short form | Description |
@@ -102,10 +108,17 @@ Command-line options:
 | `--client` | `-c` | Convert client WZ/IMG data, including bitmaps and audio. |
 | `--server` | `-s` | Convert server data without client bitmap and audio output. |
 | `--lz4hc` | `-h` | Use LZ4 high-compression mode for bitmap output. |
+| `--threads N` | `-t N` | Use N bitmap worker threads (1-64, default: up to 8). |
 
 At least one input file or directory must be provided. The converter writes each NX file next to its source WZ or IMG file. If the destination NX file already exists, that file is skipped.
 
 Client bitmap compression results are cached in a shared `.NoLifeWzToNx.cache` directory next to the inputs. WZ/IMG files in the same directory reuse unchanged bitmaps even when the input filename changes. The bitmap progress line shows the completed count, percentage, cache hits, and images compressed during the current run. A changed bitmap, compression mode, or bitmap format automatically uses a separate cache entry.
+
+## NX raw binary extension
+
+WZ `RawData` and `Canvas#Video` payloads are copied byte-for-byte into the NX file, including payloads with child properties or zero length. They are available in both client and server output.
+
+The extension keeps the `PKG4` header and the existing 20-byte node layout. Header offset 52 stores the raw entry count as a `uint32`, and offset 56 stores the raw offset-table position as a `uint64`. Node type 8 is raw binary; its 8-byte data field contains the raw entry ID and payload length as two `uint32` values. Each raw offset-table entry is a `uint64` absolute file offset. Files without raw entries retain zeroes in header bytes 52 through 63.
 
 ## Dependencies
 
