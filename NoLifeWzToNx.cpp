@@ -395,6 +395,7 @@ namespace nl {
             bitmap_table_offset, audio_offset, audio_table_offset, raw_offset, raw_table_offset;
         bool client, hc;
         std::string wzfilename, nxfilename;
+        sys::path cache_directory;
         unsigned threads;
         bool skip = false;
         // Methods
@@ -1146,7 +1147,6 @@ namespace nl {
 
             std::cout << "Writing bitmaps.....";
             std::error_code cache_error;
-            auto cache_directory = sys::path(wzfilename).parent_path() / ".NoLifeWzToNx.cache";
             if (!bitmaps.empty()) sys::create_directories(cache_directory, cache_error);
             auto cache_enabled = !cache_error;
             if (!cache_enabled) {
@@ -1598,10 +1598,11 @@ namespace nl {
             }
             std::cout << std::endl;
         }
-        wztonx(sys::path filename, bool client, bool hc, unsigned threads)
+        wztonx(sys::path filename, sys::path cache_root, bool client, bool hc, unsigned threads)
             : client(client), hc(hc), threads(threads) {
             wzfilename = u8string(filename);
             nxfilename = u8string(filename.replace_extension(".nx"));
+            cache_directory = cache_root / ".NoLifeWzToNx.cache";
             if (!std::ifstream{ wzfilename }.is_open()) { return; }
             if (std::ifstream{ nxfilename }.good()) {
                 skip = true;
@@ -1625,8 +1626,8 @@ namespace nl {
     };
 
     struct imgtonx : wztonx {
-        imgtonx(sys::path filename, bool client, bool hc, unsigned threads)
-            : wztonx{ filename, client, hc, threads } {}
+        imgtonx(sys::path filename, sys::path cache_root, bool client, bool hc, unsigned threads)
+            : wztonx{ filename, cache_root, client, hc, threads } {}
         void parse_file() override {
             std::cout << "Parsing input.......";
             in.open(wzfilename);
@@ -1696,21 +1697,26 @@ Converts WZ files into NX files
         }
     }
 
-    auto convert = [&](sys::path const& p) {
+    auto convert = [&](sys::path const& p, sys::path const& cache_root) {
         if (u8string(p.extension()) == ".img") {
-            nl::imgtonx{ p, type == client, hc, threads }.convert_file();
+            nl::imgtonx{ p, cache_root, type == client, hc, threads }.convert_file();
         }
         else if (u8string(p.extension()) == ".wz") {
-            nl::wztonx{ p, type == client, hc, threads }.convert_file();
+            nl::wztonx{ p, cache_root, type == client, hc, threads }.convert_file();
         }
     };
 
     for (auto& p : paths) {
-        if (sys::is_regular_file(p)) { convert(p); }
+        if (sys::is_regular_file(p)) { convert(p, p.parent_path()); }
         else if (sys::is_directory(p)) {
           for (sys::recursive_directory_iterator it{p}, end{}; it != end;
                ++it) {
-            convert(*it);
+            if (it->is_directory()
+                && it->path().filename() == ".NoLifeWzToNx.cache") {
+                it.disable_recursion_pending();
+                continue;
+            }
+            convert(*it, p);
           }
         }
     }

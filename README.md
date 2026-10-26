@@ -112,7 +112,7 @@ Command-line options:
 
 At least one input file or directory must be provided. The converter writes each NX file next to its source WZ or IMG file. If the destination NX file already exists, that file is skipped.
 
-Client bitmap compression results are cached in a shared `.NoLifeWzToNx.cache` directory next to the inputs. WZ/IMG files in the same directory reuse unchanged bitmaps even when the input filename changes. The bitmap progress line shows the completed count, percentage, cache hits, and images compressed during the current run. A changed bitmap, compression mode, or bitmap format automatically uses a separate cache entry.
+Client bitmap compression results are cached in a shared `.NoLifeWzToNx.cache` directory. For a directory input, one cache is created at the specified root and shared by all recursively converted WZ/IMG files; for a single-file input, the cache is created next to that file. Unchanged bitmaps are reused even when the input filename changes. The bitmap progress line shows the completed count, percentage, cache hits, and images compressed during the current run. A changed bitmap, compression mode, or bitmap format automatically uses a separate cache entry.
 
 ## NX raw binary extension
 
