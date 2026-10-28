@@ -920,7 +920,6 @@ namespace nl {
             n.data.string = string;
         }
         virtual void parse_file() {
-            std::cout << "Working on " << wzfilename << std::endl;
             std::cout << "Parsing input.......";
             in.open(wzfilename);
             auto magic = in.read<uint32_t>();
@@ -1638,16 +1637,25 @@ namespace nl {
             wzfilename = u8string(filename);
             nxfilename = u8string(filename.replace_extension(".nx"));
             cache_directory = cache_root / ".NoLifeWzToNx.cache";
-            if (!std::ifstream{ wzfilename }.is_open()) { return; }
+            if (!std::ifstream{ wzfilename }.is_open()) {
+                skip = true;
+                std::cerr << "Skipping unreadable input [" << wzfilename << ']'
+                    << std::endl;
+                return;
+            }
             if (std::ifstream{ nxfilename }.good()) {
                 skip = true;
-                std::cout << nxfilename << " exist. Skip!" << std::endl;
+                std::cout << "Skipping existing output [" << wzfilename << "] -> ["
+                    << nxfilename << ']' << std::endl;
+                return;
             }
-            std::cout << wzfilename << " -> " << nxfilename << std::endl;
         }
 
         void convert_file() {
             if (skip) return;
+            auto kind = u8string(sys::path{ wzfilename }.extension()) == ".img" ? "IMG" : "WZ";
+            std::cout << "Converting " << kind << " [" << wzfilename << "] -> ["
+                << nxfilename << ']' << std::endl;
             parse_file();
             open_output();
             write_nodes();
@@ -1657,6 +1665,8 @@ namespace nl {
                 write_audio();
                 write_bitmaps();
             }
+            std::cout << "Completed " << kind << " [" << wzfilename << ']'
+                << std::endl;
         }
     };
 
@@ -1746,12 +1756,12 @@ Converts WZ files into NX files
         else if (sys::is_directory(p)) {
           for (sys::recursive_directory_iterator it{p}, end{}; it != end;
                ++it) {
-            if (it->is_directory()
-                && it->path().filename() == ".NoLifeWzToNx.cache") {
-                it.disable_recursion_pending();
+            if (it->is_directory()) {
+                if (it->path().filename() == ".NoLifeWzToNx.cache")
+                    it.disable_recursion_pending();
                 continue;
             }
-            convert(*it, p);
+            if (it->is_regular_file()) convert(it->path(), p);
           }
         }
     }
