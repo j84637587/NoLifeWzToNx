@@ -529,7 +529,7 @@ namespace nl {
         void find_links(id_t link_node, std::string const& str) {
             auto& n = nodes[link_node];
             auto& s = strings[n.name];
-            if (s == str) {
+            if (s == str && n.data_type == node::type::string) {
                 link_path.push_back(link_node);
                 //name_path.push_back(s);
                 links.push_back(link_path);
