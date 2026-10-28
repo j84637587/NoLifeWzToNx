@@ -1598,10 +1598,11 @@ namespace nl {
             }
             std::cout << std::endl;
         }
-        wztonx(sys::path filename, sys::path cache_root, bool client, bool hc, unsigned threads)
+        wztonx(sys::path filename, sys::path cache_root, bool client, bool hc, unsigned threads,
+            sys::path output = {})
             : client(client), hc(hc), threads(threads) {
             wzfilename = u8string(filename);
-            nxfilename = u8string(filename.replace_extension(".nx"));
+            nxfilename = u8string(output.empty() ? filename.replace_extension(".nx") : output);
             cache_directory = cache_root / ".NoLifeWzToNx.cache";
             if (!std::ifstream{ wzfilename }.is_open()) { return; }
             if (std::ifstream{ nxfilename }.good()) {
@@ -1626,8 +1627,9 @@ namespace nl {
     };
 
     struct imgtonx : wztonx {
-        imgtonx(sys::path filename, sys::path cache_root, bool client, bool hc, unsigned threads)
-            : wztonx{ filename, cache_root, client, hc, threads } {}
+        imgtonx(sys::path filename, sys::path cache_root, bool client, bool hc, unsigned threads,
+            sys::path output = {})
+            : wztonx{ filename, cache_root, client, hc, threads, output } {}
         void parse_file() override {
             std::cout << "Parsing input.......";
             in.open(wzfilename);
@@ -1638,6 +1640,10 @@ namespace nl {
     };
 }
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--output-version") {
+        std::cout << "NoLifeWzToNx-output-v1" << std::endl;
+        return 0;
+    }
     auto old = std::cout.rdbuf();
     //auto log = std::ofstream{ "NoLifeWzToNx.log" };
     //std::cout.rdbuf(log.rdbuf());
@@ -1657,6 +1663,7 @@ Converts WZ files into NX files
     enum { client, server, none } type{ none };
     bool hc{ false };
     std::vector<sys::path> paths;
+    sys::path output_directory;
     auto hardware_threads = std::thread::hardware_concurrency();
     unsigned threads = std::min(hardware_threads ? hardware_threads : 1u, 8u);
     std::regex reg1{ "--([a-z]+)" };
@@ -1677,6 +1684,13 @@ Converts WZ files into NX files
             type = server;
         }
         else if (arg == "--lz4hc" || arg == "-h") { hc = true; }
+        else if (arg == "--output") {
+            if (++arg_index >= args.size() || args[arg_index].empty()) {
+                std::cerr << "Missing output directory after --output." << std::endl;
+                return 1;
+            }
+            output_directory = args[arg_index];
+        }
         else if (arg == "--threads" || arg == "-t") {
             if (++arg_index >= args.size()
                 || args[arg_index].empty()
@@ -1697,12 +1711,27 @@ Converts WZ files into NX files
         }
     }
 
+    if (!output_directory.empty() && paths.size() != 1) {
+        std::cerr << "--output requires exactly one input file or directory." << std::endl;
+        return 1;
+    }
     auto convert = [&](sys::path const& p, sys::path const& cache_root) {
-        if (u8string(p.extension()) == ".img") {
-            nl::imgtonx{ p, cache_root, type == client, hc, threads }.convert_file();
+        auto extension = u8string(p.extension());
+        std::transform(extension.begin(), extension.end(), extension.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (extension != ".img" && extension != ".wz") return;
+        sys::path output;
+        if (!output_directory.empty()) {
+            auto relative = sys::is_directory(paths.front())
+                ? p.lexically_relative(paths.front()) : p.filename();
+            output = output_directory / relative.replace_extension(".nx");
+            sys::create_directories(output.parent_path());
         }
-        else if (u8string(p.extension()) == ".wz") {
-            nl::wztonx{ p, cache_root, type == client, hc, threads }.convert_file();
+        if (extension == ".img") {
+            nl::imgtonx{ p, cache_root, type == client, hc, threads, output }.convert_file();
+        }
+        else {
+            nl::wztonx{ p, cache_root, type == client, hc, threads, output }.convert_file();
         }
     };
 

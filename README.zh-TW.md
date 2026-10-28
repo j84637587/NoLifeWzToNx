@@ -114,6 +114,39 @@ x64\Debug\NoLifeWzToNx.exe "F:\path\to\file.wz" -c -h --threads 8
 
 Client bitmap 的壓縮結果會快取在共用的 `.NoLifeWzToNx.cache` 目錄。輸入資料夾時，只會在指定的根目錄建立一份 cache，供所有遞迴轉換的 WZ/IMG 共用；輸入單一檔案時，則在該檔案旁建立 cache。即使輸入檔名不同，也能重用未變更 bitmap 的 LZ4 資料。bitmap 進度列會顯示完成數、百分比、快取命中數與本次實際壓縮數；bitmap 內容、壓縮模式或格式變更時會自動使用不同的快取項目。
 
+## 日常轉換: 只保留兩版 NX
+
+編譯新版工具後, 將**目前使用的一套** WZ/IMG 放進 `wz/current/`, 然後雙擊 `convert-local.bat`。需 Windows PowerShell 5.1 或更新版本。
+
+```text
+wz/
+  current/           # 目前編輯的 WZ/IMG, 維持固定檔名
+  backup/            # 修改前自行備份, 不參與轉換
+nx-local/
+  current/           # 最新成功的整套 NX
+  previous/          # 上一套不同內容的成功 NX
+```
+
+- 每次先產生暫存 NX, 全部完成且通過檔案數量、PKG4 header 與來源雜湊檢查後才換版。
+- 失敗不替換目前版或上一版; 來源轉換途中變更也會拒絕換版。這是基本輸出檢查, 不代表遊戲內相容性驗證。
+- 第三套不同內容轉換成功後, 自動移除更舊的 NX; 相同內容不消耗上一版。
+- 來源 WZ/IMG 不會被刪除或自動備份。修改前自行備份到 `wz/backup/`, 確認新版本沒問題後再更新備份。
+- 不掃描或清理既有的編號歷史檔。不要把混有 `UI39.wz`, `UI40.wz` 等歷史版本的整個 `wz/` 當來源。
+- 暫存及換版中斷可在下次執行時恢復; 遇到被占用的檔案或不認得的檔案會中止, 不強制刪除。
+- `nx-local/` 是工具專用目錄, 不要放 WZ、手動備份或其他文件。只會清理該目錄內受管理的暫存及過期 NX。
+- 測試客戶端時使用 `nx-local/current/` 的內容; 需要回退時可取用 `previous/`。此工具不會自動切換客戶端或發布。
+- 轉換快取仍共用來源旁的 `.NoLifeWzToNx.cache`, 本次不自動清理快取。
+
+如果目前工作檔案在其他資料夾, 可指定來源 (不要指向 NX 輸出目錄):
+
+```powershell
+.\convert-local.ps1 -Source 'F:\NovaAssets\wz-current'
+```
+
+亦可使用 `-Output`, `-ConverterPath`, `-Mode server`, `-Threads 8`, `-Lz4HC`。輸出目錄第一次使用必須為空, 來源與輸出不得互相包含。
+
+底層轉換器新增 `--output DIR`, 可將單一來源檔案或目錄輸出到別處並保留相對路徑。省略時仍沿用來源旁輸出及同名 NX 跳過的既有行為; **兩版保留與失敗保護請使用 `convert-local` 入口**。
+
 ## NX raw binary 擴充
 
 WZ 的 `RawData` 與 `Canvas#Video` payload 會逐位元組複製到 NX，包含具有子屬性或長度為零的 payload；client 與 server 輸出都會保留 raw binary。
