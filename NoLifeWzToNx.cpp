@@ -1143,6 +1143,7 @@ namespace nl {
                 std::string diagnostics;
                 std::exception_ptr error;
                 bool cache_hit = false;
+                bool cacheable = true;
             };
 
             std::cout << "Writing bitmaps.....";
@@ -1300,26 +1301,35 @@ namespace nl {
                 std::vector<uint8_t> output(biggest);
                 std::ostringstream diagnostics;
                 auto decompressed = 0;
-                auto decompress = [&] {
+                struct inflate_result {
+                    int status = Z_STREAM_ERROR;
+                    uLong total_in = 0;
+                    uLong total_out = 0;
+                    std::string message;
+                };
+                auto decompress = [&](inflate_result& result) {
                     z_stream strm = {};
                     strm.next_in = input.data();
                     strm.avail_in = length;
-                    auto init_status = inflateInit(&strm);
-                    if (init_status != Z_OK) {
-                        diagnostics << "zlib init error of " << std::dec << init_status << std::endl;
-                        return false;
-                    }
+                    result.status = inflateInit(&strm);
+                    if (result.status != Z_OK) return false;
                     strm.next_out = output.data();
                     strm.avail_out = static_cast<unsigned>(expected);
-                    auto err = inflate(&strm, Z_FINISH);
-                    decompressed = static_cast<int>(strm.total_out);
+                    result.status = inflate(&strm, Z_FINISH);
+                    result.total_in = strm.total_in;
+                    result.total_out = strm.total_out;
+                    if (strm.msg) result.message = strm.msg;
                     inflateEnd(&strm);
-                    if (static_cast<size_t>(decompressed) != expected
-                        || (err != Z_STREAM_END && err != Z_BUF_ERROR)) {
-                        if (err != Z_DATA_ERROR)
-                            diagnostics << "zlib error of " << std::dec << err << std::endl;
-                        return false;
-                    }
+
+                    auto output_complete = result.total_out == expected;
+                    auto complete_stream = output_complete
+                        && (result.status == Z_STREAM_END || result.status == Z_BUF_ERROR);
+                    auto complete_legacy_stream = output_complete
+                        && result.status == Z_DATA_ERROR
+                        && result.total_in == length
+                        && result.message == "invalid block type";
+                    if (!complete_stream && !complete_legacy_stream) return false;
+                    decompressed = static_cast<int>(result.total_out);
                     return true;
                     };
                 auto decrypt = [&] {
@@ -1344,12 +1354,37 @@ namespace nl {
                     };
 
                 std::copy(job.original, job.original + length, input.begin());
-                if (!decompress() && (!decrypt() || !decompress())) {
+                auto direct_length = length;
+                inflate_result direct_result;
+                auto inflated = decompress(direct_result);
+                inflate_result decrypted_result;
+                auto attempted_decrypted_inflate = false;
+                if (!inflated && decrypt()) {
+                    attempted_decrypted_inflate = true;
+                    inflated = decompress(decrypted_result);
+                }
+                if (!inflated) {
                     auto first = job.length > 0 ? static_cast<unsigned>(job.original[0]) : 0;
                     auto second = job.length > 1 ? static_cast<unsigned>(job.original[1]) : 0;
                     diagnostics << "Unable to inflate: 0x" << std::setfill('0') << std::setw(2)
                         << std::hex << first << " 0x" << std::setw(2) << second << std::dec
-                        << std::endl;
+                        << " index=" << job.index << " size=" << job.width << 'x' << job.height
+                        << " format=" << job.format1 << ',' << job.format2
+                        << " length=" << job.length
+                        << " direct=" << direct_result.status << '(' << direct_result.total_in
+                        << '/' << direct_length << ',' << direct_result.total_out << '/' << expected
+                        << ')';
+                    if (!direct_result.message.empty())
+                        diagnostics << " [" << direct_result.message << ']';
+                    if (attempted_decrypted_inflate) {
+                        diagnostics << " decrypted=" << decrypted_result.status << '('
+                            << decrypted_result.total_in << '/' << length << ','
+                            << decrypted_result.total_out << '/' << expected << ')';
+                        if (!decrypted_result.message.empty())
+                            diagnostics << " [" << decrypted_result.message << ']';
+                    }
+                    diagnostics << std::endl;
+                    result.cacheable = false;
                     format1 = 2;
                     format2 = 0;
                     format = 2;
@@ -1486,7 +1521,7 @@ namespace nl {
                     last_percent = std::numeric_limits<unsigned>::max();
                 }
                 auto final_size = static_cast<uint32_t>(result.compressed.size());
-                if (!result.cache_hit && cache_enabled) {
+                if (!result.cache_hit && result.cacheable && cache_enabled) {
                     std::ofstream cache_file(
                         jobs[index].cache_path, std::ios::binary | std::ios::trunc);
                     if (cache_file) {
