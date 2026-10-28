@@ -3,6 +3,7 @@
 /x64
 /x86
 /wz
+/nx-local
 /CMakeUserPresets.json
 
 *.log
