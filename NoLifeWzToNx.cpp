@@ -1,3 +1,4 @@
+#include "SoundFontPayload.h"
 //////////////////////////////////////////////////////////////////////////////////
 //	This file is part of the continued NoLifeStory project						//
 //	Copyright (C) 2014-2020  Peter Atashian, Ryan Payton						//
@@ -716,7 +717,7 @@ namespace nl {
             for (auto it : directories) directory(it);
             nodes_to_sort.emplace_back(ni, count);
         }
-        void extended_property(id_t prop_node, size_t p_offset) {
+        void extended_property(id_t prop_node, size_t p_offset, size_t property_end = 0) {
             auto& n = nodes[prop_node];
             auto& st = strings[read_prop_string(p_offset)];
             if (st == "Property") {
@@ -753,19 +754,48 @@ namespace nl {
                     auto& nn = nodes[ni + i];
                     auto es = std::to_string(i);
                     nn.name = add_string(std::move(es));
-                    extended_property(ni, p_offset);
+                    extended_property(ni, p_offset, property_end);
                 }
                 nodes_to_sort.emplace_back(ni, count);
             }
             else if (st == "Sound_DX8") {
+                auto ensure_available = [&](size_t length) {
+                    auto position = in.tell();
+                    if (!property_end || property_end > current_image_end ||
+                        position > property_end || length > property_end - position)
+                        throw std::runtime_error("Sound_DX8 exceeds its extended property");
+                };
+                auto read_length = [&] {
+                    ensure_available(1);
+                    auto value = in.read<int8_t>();
+                    if (value != -128) return static_cast<int32_t>(value);
+                    ensure_available(sizeof(int32_t));
+                    return in.read<int32_t>();
+                };
+                ensure_available(1);
+                in.skip(1);
+                auto length = read_length();
+                read_length(); // duration
+                if (length < 0) throw std::runtime_error("Sound_DX8 has a negative length");
+                ensure_available(static_cast<size_t>(length));
+                auto payload = property_end - static_cast<size_t>(length);
+                audio a;
+                if (is_sfnt_payload(reinterpret_cast<const uint8_t*>(in.base + payload), static_cast<size_t>(length))) {
+                    // Keep NX audio type 6 for existing reader compatibility, but
+                    // store only the font: no WAVEFORMAT header or adjacent node bytes.
+                    a = { static_cast<uint32_t>(length), payload };
+                } else {
+                    // Preserve the existing 82-byte audio contract used by BASS clients.
+                    if (static_cast<uint32_t>(length) > std::numeric_limits<uint32_t>::max() - 82u)
+                        throw std::runtime_error("Sound_DX8 audio length overflows NX");
+                    auto stored_length = static_cast<uint32_t>(length) + 82u;
+                    if (in.tell() > in.file_size || stored_length > in.file_size - in.tell())
+                        throw std::runtime_error("Sound_DX8 audio exceeds its input file");
+                    a = { stored_length, in.tell() };
+                }
                 n.data_type = node::type::audio;
                 n.data.audio.id = static_cast<uint32_t>(audios.size());
-                audio a;
-                in.skip(1); // Always 0
-                a.length = static_cast<uint32_t>(in.read_cint()) + 82u;
                 n.data.audio.length = a.length;
-                in.read_cint();
-                a.data = in.tell();
                 audios.push_back(a);
             }
             else if (st == "RawData" || st == "Canvas#Video") {
@@ -861,8 +891,15 @@ namespace nl {
                     nn.data.string = read_prop_string(p_offset);
                     break;
                 case 0x09:
-                    p = in.read<int32_t>() + in.tell();
-                    extended_property(ni + i, p_offset);
+                    {
+                        auto length = in.read<int32_t>();
+                        auto start = in.tell();
+                        if (length < 0 || start > current_image_end ||
+                            static_cast<size_t>(length) > current_image_end - start)
+                            throw std::runtime_error("Extended property exceeds its containing image");
+                        p = start + static_cast<size_t>(length);
+                    }
+                    extended_property(ni + i, p_offset, p);
                     in.seek(p);
                     break;
                 case 0x13:
