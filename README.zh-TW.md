@@ -101,6 +101,12 @@ bitmap 轉換預設最多使用 8 個 worker threads。可用 `--threads N` 或 
 x64\Debug\NoLifeWzToNx.exe "F:\path\to\file.wz" -c -h --threads 8
 ```
 
+只檢查 WZ 格式與舊格式的版本候選值，不執行轉換：
+
+```bat
+x64\Debug\NoLifeWzToNx.exe "F:\path\to\file.wz" --info
+```
+
 命令列選項：
 
 | 選項 | 簡寫 | 說明 |
@@ -109,6 +115,7 @@ x64\Debug\NoLifeWzToNx.exe "F:\path\to\file.wz" -c -h --threads 8
 | `--server` | `-s` | 轉換 Server 資料，不輸出 Client bitmap 與 audio。 |
 | `--lz4hc` | `-h` | bitmap 輸出使用 LZ4 高壓縮模式。 |
 | `--threads N` | `-t N` | 使用 N 個 bitmap worker threads（1-64，預設最多 8）。 |
+| `--info` | `-i` | 顯示 WZ 格式與舊格式版本候選值，不執行轉換。 |
 
 至少必須提供一個輸入檔案或資料夾。轉換器會將 NX 檔案寫入來源 WZ 或 IMG 檔案所在的資料夾。如果目的 NX 檔案已存在，該檔案會被跳過。
 

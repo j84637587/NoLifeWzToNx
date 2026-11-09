@@ -101,6 +101,12 @@ Bitmap conversion uses up to 8 worker threads by default. Use `--threads N` or `
 x64\Debug\NoLifeWzToNx.exe "F:\path\to\file.wz" -c -h --threads 8
 ```
 
+Inspect WZ format and legacy version candidates without converting:
+
+```bat
+x64\Debug\NoLifeWzToNx.exe "F:\path\to\file.wz" --info
+```
+
 Command-line options:
 
 | Option | Short form | Description |
@@ -109,6 +115,7 @@ Command-line options:
 | `--server` | `-s` | Convert server data without client bitmap and audio output. |
 | `--lz4hc` | `-h` | Use LZ4 high-compression mode for bitmap output. |
 | `--threads N` | `-t N` | Use N bitmap worker threads (1-64, default: up to 8). |
+| `--info` | `-i` | Show WZ format and legacy version candidates without converting. |
 
 At least one input file or directory must be provided. The converter writes each NX file next to its source WZ or IMG file. If the destination NX file already exists, that file is skipped.
 

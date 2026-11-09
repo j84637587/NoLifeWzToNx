@@ -368,6 +368,17 @@ namespace nl {
         uint32_t packed_raw = 0;
         imapfile* input = nullptr;
     };
+    uint32_t compute_version_hash(int version) {
+        uint32_t hash = 0;
+        for (auto c : std::to_string(version))
+            hash = hash * 32 + static_cast<uint8_t>(c) + 1;
+        return hash;
+    }
+    uint8_t derive_header_byte(uint32_t hash) {
+        return static_cast<uint8_t>(~(
+            ((hash >> 24) & 0xff) ^ ((hash >> 16) & 0xff)
+            ^ ((hash >> 8) & 0xff) ^ (hash & 0xff)));
+    }
     struct nx_bitmap {
         uint16_t width;
         uint16_t height;
@@ -555,6 +566,7 @@ namespace nl {
         char16_t const* u16key = nullptr;
         std::vector<std::pair<id_t, int32_t>> imgs;
         size_t file_start = 0;
+        bool new_wz_format = false;
         std::vector<id_t> uol_path;
         std::vector<std::vector<id_t>> uols;
         std::vector<id_t> link_path;
@@ -635,6 +647,7 @@ namespace nl {
                 }
                 if (std::any_of(str_buf.begin(), str_buf.end(),
                     [](char const& c) { return static_cast<uint8_t>(c) >= 0x80; })) {
+                    wstr_buf.clear();
                     std::transform(str_buf.cbegin(), str_buf.cend(), std::back_inserter(wstr_buf),
                         [](char c) { return cp1252[static_cast<unsigned char>(c)]; });
                     return add_string(convert_str(wstr_buf));
@@ -979,7 +992,7 @@ namespace nl {
                 {
                     auto s = in.read<int32_t>();
                     auto p = in.tell();
-                    in.seek(file_start + s);
+                    in.seek(file_start + s + (new_wz_format ? 1 : 0));
                     type = in.read<uint8_t>();
                     nn.name = read_enc_string();
                     in.seek(p);
@@ -1334,10 +1347,64 @@ namespace nl {
             for (auto i = 0u; i < slen; ++i) {
                 str_buf[i] = static_cast<char8_t>(os[i] ^ u8key[i]);
             }
+            in.skip(slen);
             auto string = add_string(str_buf);
             auto& n = nodes[script_node];
             n.data_type = node::type::string;
             n.data.string = string;
+        }
+        size_t detect_directory_start() {
+            if (file_start >= in.file_size)
+                throw std::runtime_error("Invalid WZ data offset");
+            auto position = file_start;
+            auto first = static_cast<int8_t>(in.base[position++]);
+            auto count = static_cast<int32_t>(first);
+            if (first == -128) {
+                if (position > in.file_size || sizeof(count) > in.file_size - position)
+                    throw std::runtime_error("Invalid WZ directory count");
+                std::memcpy(&count, in.base + position, sizeof(count));
+                position += sizeof(count);
+            }
+            if (position >= in.file_size)
+                throw std::runtime_error("Missing WZ directory type");
+            auto type = static_cast<uint8_t>(in.base[position]);
+            new_wz_format = count > 0 && type >= 1 && type <= 4;
+            auto directory_start = file_start + (new_wz_format ? 0 : 2);
+            if (directory_start >= in.file_size)
+                throw std::runtime_error("Invalid WZ directory offset");
+            return directory_start;
+        }
+        void detect_version() {
+            in.open(wzfilename);
+            if (in.read<uint32_t>() != 0x31474B50)
+                throw std::runtime_error("Not a valid WZ file");
+            in.skip(8);
+            file_start = in.read<uint32_t>();
+            if (file_start > in.file_size || sizeof(uint16_t) > in.file_size - file_start)
+                throw std::runtime_error("Invalid WZ data offset");
+            uint16_t first_bytes;
+            std::memcpy(&first_bytes, in.base + file_start, sizeof(first_bytes));
+            detect_directory_start();
+
+            std::cout << "File: " << wzfilename << '\n'
+                << "Data offset: 0x" << std::hex << file_start << std::dec << '\n';
+            if (new_wz_format) {
+                std::cout << "Format: New (no version hash)\n"
+                    << "Version: Cannot be determined from file\n\n";
+                return;
+            }
+            std::cout << "Format: Legacy (with version hash)\n"
+                << "Version hash: 0x" << std::hex << first_bytes << std::dec << '\n';
+            std::vector<int> candidates;
+            auto header_byte = static_cast<uint8_t>(first_bytes & 0xff);
+            for (auto version = 0; version < 1000; ++version) {
+                if (derive_header_byte(compute_version_hash(version)) == header_byte)
+                    candidates.push_back(version);
+            }
+            std::cout << "Version candidates:";
+            if (candidates.empty()) std::cout << " none";
+            for (auto candidate : candidates) std::cout << " v" << candidate;
+            std::cout << "\n\n";
         }
         void parse_wz_input(bool show_progress) {
             if (show_progress) std::cout << "Parsing input.......";
@@ -1347,12 +1414,12 @@ namespace nl {
               throw std::runtime_error("Not a valid WZ file");
             in.skip(8);
             file_start = in.read<uint32_t>();
-            // Just skip the copyright string
-            in.seek(file_start + 2);
+            auto directory_start = detect_directory_start();
+            in.seek(directory_start);
             in.read_cint();
             in.skip(1);
             deduce_key();
-            in.seek(file_start + 2);
+            in.seek(directory_start);
             add_string({});
             directory(0);
             for (auto &it : imgs)
@@ -2232,6 +2299,7 @@ Converts WZ files into NX files
     std::cout << std::endl;
     enum { client, server, none } type{ none };
     bool hc{ false };
+    bool info_only{ false };
     std::vector<sys::path> paths;
     sys::path output_directory;
     auto hardware_threads = std::thread::hardware_concurrency();
@@ -2254,6 +2322,7 @@ Converts WZ files into NX files
             type = server;
         }
         else if (arg == "--lz4hc" || arg == "-h") { hc = true; }
+        else if (arg == "--info" || arg == "-i") { info_only = true; }
         else if (arg == "--output") {
             if (++arg_index >= args.size() || args[arg_index].empty()) {
                 std::cerr << "Missing output directory after --output." << std::endl;
@@ -2281,6 +2350,10 @@ Converts WZ files into NX files
         }
     }
 
+    if (info_only && !output_directory.empty()) {
+        std::cerr << "--info cannot be combined with --output." << std::endl;
+        return 1;
+    }
     if (!output_directory.empty() && paths.size() != 1) {
         std::cerr << "--output requires exactly one input file or directory." << std::endl;
         return 1;
@@ -2301,6 +2374,7 @@ Converts WZ files into NX files
             ? input.lexically_relative(paths.front()) : input.filename();
         return output_directory / relative.replace_extension(".nx");
     };
+    auto failed = false;
     auto convert = [&](sys::path const& p, sys::path const& cache_root) {
         auto extension = lower_extension(p);
         if (extension != ".img" && extension != ".wz") return;
@@ -2309,12 +2383,19 @@ Converts WZ files into NX files
             output = output_path_for(p);
             sys::create_directories(output.parent_path());
         }
-        if (extension == ".img") {
-            nl::imgtonx{ p, cache_root, type == client, hc, threads, output }.convert_file();
+        try {
+            if (extension == ".img") {
+                nl::imgtonx{ p, cache_root, type == client, hc, threads, output }.convert_file();
+            }
+            else {
+                nl::wztonx{
+                    p, cache_root, type == client, hc, threads, output, &registry }.convert_file();
+            }
         }
-        else {
-            nl::wztonx{
-                p, cache_root, type == client, hc, threads, output, &registry }.convert_file();
+        catch (std::exception const& error) {
+            failed = true;
+            std::cerr << "Error converting [" << u8string(p) << "]: "
+                << error.what() << std::endl;
         }
     };
 
@@ -2336,6 +2417,21 @@ Converts WZ files into NX files
           for (auto const& file : directory_files) files.emplace_back(file, p);
         }
     }
+    if (info_only) {
+        for (auto const& file : files) {
+            if (lower_extension(file.first) != ".wz") continue;
+            try {
+                nl::wztonx{
+                    file.first, file.second, false, false, threads }.detect_version();
+            }
+            catch (std::exception const& error) {
+                failed = true;
+                std::cerr << "Error reading [" << u8string(file.first) << "]: "
+                    << error.what() << std::endl;
+            }
+        }
+        return failed ? 1 : 0;
+    }
     auto needs_wz_conversion = std::any_of(files.begin(), files.end(), [&](auto const& file) {
         return lower_extension(file.first) == ".wz"
             && !sys::is_regular_file(output_path_for(file.first));
@@ -2345,10 +2441,17 @@ Converts WZ files into NX files
         for (auto const& file : files) {
             if (lower_extension(file.first) != ".wz") continue;
             std::cout << "Indexing WZ [" << u8string(file.first) << "]..." << std::flush;
-            nl::wztonx scanner{
-                file.first, file.second, true, hc, threads, {}, &registry, false };
-            auto count = scanner.index_registry(registry);
-            std::cout << count << " bitmap(s)." << std::endl;
+            try {
+                nl::wztonx scanner{
+                    file.first, file.second, true, hc, threads, {}, &registry, false };
+                auto count = scanner.index_registry(registry);
+                std::cout << count << " bitmap(s)." << std::endl;
+            }
+            catch (std::exception const& error) {
+                failed = true;
+                std::cerr << "Error indexing [" << u8string(file.first) << "]: "
+                    << error.what() << std::endl;
+            }
         }
         std::cout << "WZ registry ready: " << registry.bitmaps.size()
             << " bitmap path(s)." << std::endl;
@@ -2359,4 +2462,5 @@ Converts WZ files into NX files
         << std::chrono::duration_cast<std::chrono::seconds>(b - a).count() << " seconds"
         << std::endl;
     std::cout.rdbuf(old);
+    return failed ? 1 : 0;
 }
