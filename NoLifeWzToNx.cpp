@@ -363,6 +363,7 @@ namespace nl {
         uint64_t data;
         uint8_t const* key;
         bool packed = false;
+        uint32_t packed_raw = 0;
     };
     struct raw_binary {
         uint32_t length;
@@ -891,29 +892,55 @@ namespace nl {
                 bitmaps[bitmap_id].key, width, height, stored_pages ? stored_pages : 1);
             if (raw_binaries.size() >= UINT32_MAX)
                 throw std::runtime_error("NX raw binary table is too large");
-            const auto count = nodes[prop_node].num;
-            const auto old_children = nodes[prop_node].children;
-            if (count == UINT16_MAX)
-                throw std::runtime_error("Packed canvas has too many child properties");
-            for (uint16_t i = 0; i < count; ++i)
-                if (strings[nodes[old_children + i].name] == nx_texture::kNodeName)
-                    throw std::runtime_error("Reserved packed canvas child already exists");
-            std::vector<node> children;
-            for (uint16_t i = 0; i < count; ++i) children.push_back(nodes[old_children + i]);
-            node precise;
-            precise.name = add_string(std::string(nx_texture::kNodeName));
-            precise.data_type = node::type::raw;
-            precise.data.raw.id = static_cast<uint32_t>(raw_binaries.size());
-            precise.data.raw.length = static_cast<uint32_t>(payload.size());
-            raw_binaries.push_back({precise.data.raw.length, 0, std::move(payload)});
-            children.push_back(precise);
-            const auto first = static_cast<id_t>(nodes.size());
-            nodes.insert(nodes.end(), children.begin(), children.end());
-            nodes[prop_node].children = first;
-            nodes[prop_node].num = static_cast<uint16_t>(count + 1);
-            nodes_to_sort.emplace_back(first, count + 1);
+            const auto raw_id = static_cast<uint32_t>(raw_binaries.size());
+            raw_binaries.push_back({static_cast<uint32_t>(payload.size()), 0, std::move(payload)});
             bitmaps[bitmap_id].packed = true;
+            bitmaps[bitmap_id].packed_raw = raw_id;
             in.seek(saved);
+        }
+
+        void attach_packed_canvases() {
+            // Links replace bitmap IDs while retaining local origin/properties.
+            // Attach precision data only after their final source has been resolved.
+            const auto original_count = nodes.size();
+            std::vector<std::pair<id_t, id_t>> clones;
+            std::vector<std::pair<id_t, id_t>> ranges;
+            for (id_t parent = 0; parent < original_count; ++parent) {
+                if (nodes[parent].data_type != node::type::bitmap) continue;
+                const auto bitmap_id = nodes[parent].data.bitmap.id;
+                if (!bitmaps[bitmap_id].packed) continue;
+                const auto count = nodes[parent].num;
+                const auto old_children = nodes[parent].children;
+                if (count == UINT16_MAX)
+                    throw std::runtime_error("Packed canvas has too many child properties");
+                std::vector<node> children;
+                for (uint16_t i = 0; i < count; ++i) {
+                    const auto child = nodes[old_children + i];
+                    if (strings[child.name] == nx_texture::kNodeName)
+                        throw std::runtime_error("Reserved packed canvas child already exists");
+                    children.push_back(child);
+                }
+                node precise;
+                precise.name = add_string(std::string(nx_texture::kNodeName));
+                precise.data_type = node::type::raw;
+                precise.data.raw.id = bitmaps[bitmap_id].packed_raw;
+                precise.data.raw.length = raw_binaries[precise.data.raw.id].length;
+                children.push_back(precise);
+                const auto first = static_cast<id_t>(nodes.size());
+                nodes.insert(nodes.end(), children.begin(), children.end());
+                nodes[parent].children = first;
+                nodes[parent].num = static_cast<uint16_t>(count + 1);
+                for (uint16_t i = 0; i < count; ++i)
+                    clones.emplace_back(old_children + i, first + i);
+                ranges.emplace_back(first, count + 1);
+            }
+            // A copied nested Canvas must receive its final child range too.
+            // Patch before sorting, while clone indices still identify the copies.
+            for (const auto& clone : clones) {
+                nodes[clone.second].children = nodes[clone.first].children;
+                nodes[clone.second].num = nodes[clone.first].num;
+            }
+            for (const auto& range : ranges) sort_nodes(range.first, range.second);
         }
 
         void sub_property(id_t prop_node, size_t p_offset) {
@@ -1103,6 +1130,7 @@ namespace nl {
             for (auto& it : links) source_fail(it, "_inlink");
             links.clear();
             std::cout << "Done!" << std::endl;
+            attach_packed_canvases();
         }
         void calculate_offsets() {
             offset = 0;

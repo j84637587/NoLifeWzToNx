@@ -26,10 +26,15 @@ def properties(items):
 def extended(data):
     return struct.pack('<I', len(data)) + data
 
-def canvas(raw, pages=1, fmt=2562, encrypted=False, child_name='origin', declared=None, fmt2=0):
-    origin = b'\x73' + ws('Shape2D#Vector2D') + ci(7) + ci(9)
-    props = properties([(child_name, 9, extended(origin))])
+def canvas(raw, pages=1, fmt=2562, encrypted=False, child_name='origin', declared=None, fmt2=0, legacy=False, link=None, origin=(7, 9), extra_items=()):
+    origin = b'\x73' + ws('Shape2D#Vector2D') + ci(origin[0]) + ci(origin[1])
+    items = [(child_name, 9, extended(origin))]
+    if link: items.append((link, 8, b'\0' + ws('atlas')))
+    props = properties(items + list(extra_items))
     compressed = zlib.compress(raw)
+    if legacy:
+        stream = zlib.compressobj()
+        compressed = stream.compress(raw) + stream.flush(zlib.Z_SYNC_FLUSH) + b'\x07'
     if encrypted:
         blocks = [compressed[i:i + 13] for i in range(0, len(compressed), 13)]
         compressed = b''.join(struct.pack('<I', len(b)) + bytes(x ^ KEY[i] for i, x in enumerate(b)) for b in blocks)
@@ -64,7 +69,7 @@ def lz4(block, expected):
     assert len(out) == expected
     return bytes(out)
 
-def read(path):
+def read(path, wanted='atlas', origin=(7, 9)):
     b = path.read_bytes()
     count, nodes = struct.unpack_from('<IQ', b, 4)
     _, strings = struct.unpack_from('<IQ', b, 16)
@@ -76,11 +81,13 @@ def read(path):
         size = struct.unpack_from('<H', b, off)[0]
         entries.append((b[off + 2:off + 2 + size].decode(), children, n, kind, value, length))
     root = entries[0]
-    atlas = next(x for x in entries[root[1]:root[1] + root[2]] if x[0] == 'atlas')
+    atlas = root
+    for part in wanted.split('/'):
+        atlas = next(x for x in entries[atlas[1]:atlas[1] + atlas[2]] if x[0] == part)
     assert atlas[3] == 5
     children = entries[atlas[1]:atlas[1] + atlas[2]]
-    origin = next(x for x in children if x[0] == 'origin')
-    assert origin[3:] == (4, 7, 9)
+    entry = next(x for x in children if x[0] == 'origin')
+    assert entry[3:] == (4, *origin)
     packed = next((x for x in children if x[0] == '__nx_texture'), None)
     if packed is None: return None
     assert packed[3] == 8 and packed[4] < raw_count
@@ -106,6 +113,7 @@ with tempfile.TemporaryDirectory() as folder:
         assert read(run('pages' + str(pages), image(canvas(raw, pages)))) == raw
     raw = b''.join(struct.pack('<I', i * 1023 + 1) for i in range(32))
     assert read(run('split-format', image(canvas(raw, 2, fmt=2, fmt2=10)))) == raw
+    assert read(run('legacy-complete', image(canvas(raw, 2, legacy=True)))) == raw
     assert read(run('list-bms', image(canvas(raw, 2, encrypted=True)))) == raw
     keys = pathlib.Path(__file__).resolve().parents[1].joinpath('Keys.cpp').read_text()
     section = keys.split('key_gms[65536] = {', 1)[1].split('};', 1)[0]
@@ -113,7 +121,33 @@ with tempfile.TemporaryDirectory() as folder:
     assert read(run('list-gms', image(canvas(raw, 2, encrypted=True)))) == raw
     KEY = bytes(65536)
     assert read(run('ordinary', image(canvas(bytes(64), 0, 2)))) is None
+    for link in ['source', '_inlink', '_outlink']:
+        items = [('atlas', 9, extended(canvas(raw, 2))),
+                 ('alias', 9, extended(canvas(bytes(64), 0, fmt=2, link=link, origin=(11, 13))))]
+        path = run('link-' + link, b'\x73' + ws('Property') + b'\0\0' + properties(items))
+        assert read(path, 'alias', (11, 13)) == raw
+        # A link must replace the packed companion as well as the legacy bitmap.
+        items[1] = ('alias', 9, extended(canvas(bytes(128), 2, link=link, origin=(11, 13))))
+        path = run('replace-' + link, b'\x73' + ws('Property') + b'\0\0' + properties(items))
+        assert read(path, 'alias', (11, 13)) == raw
+        items[0] = ('atlas', 9, extended(canvas(bytes(64), 0, fmt=2)))
+        path = run('legacy-target-' + link, b'\x73' + ws('Property') + b'\0\0' + properties(items))
+        assert read(path, 'alias', (11, 13)) is None
+    items = [('atlas', 9, extended(canvas(raw, 2))),
+             ('alias', 9, extended(b'\x73' + ws('UOL') + b'\0\0' + ws('atlas')))]
+    group = b'\x73' + ws('Property') + b'\0\0' + properties(items)
+    # UOL is resolved within a non-root image/property boundary by this converter.
+    wrapped = b'\x73' + ws('Property') + b'\0\0' + properties([('group', 9, extended(group))])
+    path = run('uol', wrapped)
+    assert read(path, 'group/alias') == raw
+    nested = canvas(raw, 2, extra_items=[('nested', 9, extended(canvas(bytes(128), 2)))])
+    path = run('nested', image(nested))
+    assert read(path, 'atlas/nested') == bytes(128)
     run('missing-page', image(canvas(bytes(64), 2)), False)
+    run('legacy-missing-page', image(canvas(bytes(64), 2, legacy=True)), False)
+    run('legacy-extra-page', image(canvas(bytes(128), 1, legacy=True)), False)
+    checksum = bytearray(image(canvas(bytes(64), 1))); checksum[-1] ^= 1
+    run('bad-checksum', bytes(checksum), False)
     run('extra-page', image(canvas(bytes(128), 1)), False)
     run('truncated', image(canvas(bytes(128), 2))[:-1], False)
     run('bad-length', image(canvas(bytes(64), declared=100000)), False)

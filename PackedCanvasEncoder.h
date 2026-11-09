@@ -29,6 +29,7 @@ inline std::vector<uint8_t> encodePages(const uint8_t* data, size_t length,
   write32(result.data() + 20, kFormat);
   write32(result.data() + 24, pages);
   write32(result.data() + 28, 1);  // Independent LZ4 block per page.
+  bool legacy_complete = false;
   for (uint32_t index = 0; index < pages; ++index) {
     stream.next_out = page.data();
     stream.avail_out = static_cast<uInt>(page_bytes);
@@ -37,6 +38,12 @@ inline std::vector<uint8_t> encodePages(const uint8_t* data, size_t length,
       const auto before_in = stream.avail_in;
       const auto before_out = stream.avail_out;
       status = inflate(&stream, Z_NO_FLUSH);
+      if (status == Z_DATA_ERROR && index + 1 == pages &&
+          stream.avail_out == 0 && stream.avail_in == 0 && stream.msg &&
+          std::strcmp(stream.msg, "invalid block type") == 0) {
+        legacy_complete = true;
+        break;
+      }
       if (status != Z_OK && status != Z_STREAM_END && status != Z_BUF_ERROR)
         throw std::runtime_error("Invalid packed canvas zlib stream");
       if (stream.avail_out && (status == Z_STREAM_END ||
@@ -55,12 +62,15 @@ inline std::vector<uint8_t> encodePages(const uint8_t* data, size_t length,
   }
   // WZ streams may omit the zlib end marker. Accept that only after all
   // declared pixels and all source bytes have been consumed, without extra pixels.
+  if (legacy_complete) return result;
   uint8_t extra;
   stream.next_out = &extra;
   stream.avail_out = 1;
   const auto status = inflate(&stream, Z_FINISH);
+  const bool legacy_tail = status == Z_DATA_ERROR && stream.msg &&
+      std::strcmp(stream.msg, "invalid block type") == 0;
   if (stream.avail_out != 1 || stream.avail_in != 0 ||
-      (status != Z_STREAM_END && status != Z_BUF_ERROR))
+      (status != Z_STREAM_END && status != Z_BUF_ERROR && !legacy_tail))
     throw std::runtime_error("Packed canvas size does not match page count");
   return result;
 }
@@ -74,11 +84,11 @@ inline std::vector<uint8_t> encode(const uint8_t* data, size_t length,
     size_t offset = 0;
     while (offset < length) {
       if (!key || length - offset < 4)
-        throw std::runtime_error("Invalid packed canvas encrypted block");
+        throw;
       const auto size = read32(data + offset);
       offset += 4;
       if (!size || size > 65536 || size > length - offset)
-        throw std::runtime_error("Invalid packed canvas encrypted block size");
+        throw;
       for (uint32_t i = 0; i < size; ++i) decrypted.push_back(data[offset + i] ^ key[i]);
       offset += size;
     }
