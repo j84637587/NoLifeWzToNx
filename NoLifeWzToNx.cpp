@@ -1,3 +1,5 @@
+#include "SoundFontPayload.h"
+#include "PackedCanvasEncoder.h"
 //////////////////////////////////////////////////////////////////////////////////
 //	This file is part of the continued NoLifeStory project						//
 //	Copyright (C) 2014-2020  Peter Atashian, Ryan Payton						//
@@ -360,10 +362,13 @@ namespace nl {
     struct bitmap {
         uint64_t data;
         uint8_t const* key;
+        bool packed = false;
+        uint32_t packed_raw = 0;
     };
     struct raw_binary {
         uint32_t length;
         uint64_t data;
+        std::vector<uint8_t> owned;
     };
     // The main class itself
     struct wztonx {
@@ -716,9 +721,9 @@ namespace nl {
             for (auto it : directories) directory(it);
             nodes_to_sort.emplace_back(ni, count);
         }
-        void extended_property(id_t prop_node, size_t p_offset) {
+        void extended_property(id_t prop_node, size_t p_offset, size_t property_end = 0) {
             auto& n = nodes[prop_node];
-            auto& st = strings[read_prop_string(p_offset)];
+            const auto st = strings[read_prop_string(p_offset)];
             if (st == "Property") {
                 in.skip(2);
                 sub_property(prop_node, p_offset);
@@ -737,6 +742,7 @@ namespace nl {
                 bitmaps.push_back({ in.tell(), reinterpret_cast<uint8_t const*>(u8key) });
                 nn.data.bitmap.width = static_cast<uint16_t>(in.read_cint());
                 nn.data.bitmap.height = static_cast<uint16_t>(in.read_cint());
+                preserve_packed_canvas(prop_node, property_end);
             }
             else if (st == "Shape2D#Vector2D") {
                 n.data_type = node::type::vector;
@@ -753,19 +759,48 @@ namespace nl {
                     auto& nn = nodes[ni + i];
                     auto es = std::to_string(i);
                     nn.name = add_string(std::move(es));
-                    extended_property(ni, p_offset);
+                    extended_property(ni, p_offset, property_end);
                 }
                 nodes_to_sort.emplace_back(ni, count);
             }
             else if (st == "Sound_DX8") {
+                auto ensure_available = [&](size_t length) {
+                    auto position = in.tell();
+                    if (!property_end || property_end > current_image_end ||
+                        position > property_end || length > property_end - position)
+                        throw std::runtime_error("Sound_DX8 exceeds its extended property");
+                };
+                auto read_length = [&] {
+                    ensure_available(1);
+                    auto value = in.read<int8_t>();
+                    if (value != -128) return static_cast<int32_t>(value);
+                    ensure_available(sizeof(int32_t));
+                    return in.read<int32_t>();
+                };
+                ensure_available(1);
+                in.skip(1);
+                auto length = read_length();
+                read_length(); // duration
+                if (length < 0) throw std::runtime_error("Sound_DX8 has a negative length");
+                ensure_available(static_cast<size_t>(length));
+                auto payload = property_end - static_cast<size_t>(length);
+                audio a;
+                if (is_sfnt_payload(reinterpret_cast<const uint8_t*>(in.base + payload), static_cast<size_t>(length))) {
+                    // Keep NX audio type 6 for existing reader compatibility, but
+                    // store only the font: no WAVEFORMAT header or adjacent node bytes.
+                    a = { static_cast<uint32_t>(length), payload };
+                } else {
+                    // Preserve the existing 82-byte audio contract used by BASS clients.
+                    if (static_cast<uint32_t>(length) > std::numeric_limits<uint32_t>::max() - 82u)
+                        throw std::runtime_error("Sound_DX8 audio length overflows NX");
+                    auto stored_length = static_cast<uint32_t>(length) + 82u;
+                    if (in.tell() > in.file_size || stored_length > in.file_size - in.tell())
+                        throw std::runtime_error("Sound_DX8 audio exceeds its input file");
+                    a = { stored_length, in.tell() };
+                }
                 n.data_type = node::type::audio;
                 n.data.audio.id = static_cast<uint32_t>(audios.size());
-                audio a;
-                in.skip(1); // Always 0
-                a.length = static_cast<uint32_t>(in.read_cint()) + 82u;
                 n.data.audio.length = a.length;
-                in.read_cint();
-                a.data = in.tell();
                 audios.push_back(a);
             }
             else if (st == "RawData" || st == "Canvas#Video") {
@@ -817,6 +852,97 @@ namespace nl {
             }
             else { throw std::runtime_error("Unknown sub property type: " + st); }
         }
+        void preserve_packed_canvas(id_t prop_node, size_t property_end) {
+            if (!client) return;
+            const auto saved = in.tell();
+            const auto bitmap_id = nodes[prop_node].data.bitmap.id;
+            const auto end = property_end ? property_end : current_image_end;
+            auto available = [&](size_t size) {
+                if (in.tell() > end || size > end - in.tell())
+                    throw std::runtime_error("Packed canvas exceeds its property");
+            };
+            auto cint = [&]() -> int32_t {
+                available(1);
+                const auto value = in.read<int8_t>();
+                if (value != -128) return value;
+                available(4);
+                return in.read<int32_t>();
+            };
+            in.seek(bitmaps[bitmap_id].data);
+            const auto width = cint();
+            const auto height = cint();
+            // format2 is a compressed integer, not always a single byte.
+            const auto format1 = cint();
+            const auto format2 = cint();
+            if (int64_t(format1) + int64_t(format2) * 256 != nx_texture::kFormat) {
+                in.seek(saved);
+                return;
+            }
+            if (width <= 0 || height <= 0 || width > 65535 || height > 65535)
+                throw std::runtime_error("Invalid packed canvas dimensions");
+            available(9);
+            const auto stored_pages = in.read<uint32_t>();
+            const auto length = in.read<uint32_t>();
+            const auto marker = in.read<uint8_t>();
+            if (!length || marker != 0)
+                throw std::runtime_error("Invalid packed canvas pixel length or marker");
+            available(length - 1);
+            auto payload = nx_texture::encode(
+                reinterpret_cast<const uint8_t*>(in.base + in.tell()), length - 1,
+                bitmaps[bitmap_id].key, width, height, stored_pages ? stored_pages : 1);
+            if (raw_binaries.size() >= UINT32_MAX)
+                throw std::runtime_error("NX raw binary table is too large");
+            const auto raw_id = static_cast<uint32_t>(raw_binaries.size());
+            raw_binaries.push_back({static_cast<uint32_t>(payload.size()), 0, std::move(payload)});
+            bitmaps[bitmap_id].packed = true;
+            bitmaps[bitmap_id].packed_raw = raw_id;
+            in.seek(saved);
+        }
+
+        void attach_packed_canvases() {
+            // Links replace bitmap IDs while retaining local origin/properties.
+            // Attach precision data only after their final source has been resolved.
+            const auto original_count = nodes.size();
+            std::vector<std::pair<id_t, id_t>> clones;
+            std::vector<std::pair<id_t, id_t>> ranges;
+            for (id_t parent = 0; parent < original_count; ++parent) {
+                if (nodes[parent].data_type != node::type::bitmap) continue;
+                const auto bitmap_id = nodes[parent].data.bitmap.id;
+                if (!bitmaps[bitmap_id].packed) continue;
+                const auto count = nodes[parent].num;
+                const auto old_children = nodes[parent].children;
+                if (count == UINT16_MAX)
+                    throw std::runtime_error("Packed canvas has too many child properties");
+                std::vector<node> children;
+                for (uint16_t i = 0; i < count; ++i) {
+                    const auto child = nodes[old_children + i];
+                    if (strings[child.name] == nx_texture::kNodeName)
+                        throw std::runtime_error("Reserved packed canvas child already exists");
+                    children.push_back(child);
+                }
+                node precise;
+                precise.name = add_string(std::string(nx_texture::kNodeName));
+                precise.data_type = node::type::raw;
+                precise.data.raw.id = bitmaps[bitmap_id].packed_raw;
+                precise.data.raw.length = raw_binaries[precise.data.raw.id].length;
+                children.push_back(precise);
+                const auto first = static_cast<id_t>(nodes.size());
+                nodes.insert(nodes.end(), children.begin(), children.end());
+                nodes[parent].children = first;
+                nodes[parent].num = static_cast<uint16_t>(count + 1);
+                for (uint16_t i = 0; i < count; ++i)
+                    clones.emplace_back(old_children + i, first + i);
+                ranges.emplace_back(first, count + 1);
+            }
+            // A copied nested Canvas must receive its final child range too.
+            // Patch before sorting, while clone indices still identify the copies.
+            for (const auto& clone : clones) {
+                nodes[clone.second].children = nodes[clone.first].children;
+                nodes[clone.second].num = nodes[clone.first].num;
+            }
+            for (const auto& range : ranges) sort_nodes(range.first, range.second);
+        }
+
         void sub_property(id_t prop_node, size_t p_offset) {
             auto& n = nodes[prop_node];
             auto count = static_cast<id_t>(in.read_cint());
@@ -861,8 +987,15 @@ namespace nl {
                     nn.data.string = read_prop_string(p_offset);
                     break;
                 case 0x09:
-                    p = in.read<int32_t>() + in.tell();
-                    extended_property(ni + i, p_offset);
+                    {
+                        auto length = in.read<int32_t>();
+                        auto start = in.tell();
+                        if (length < 0 || start > current_image_end ||
+                            static_cast<size_t>(length) > current_image_end - start)
+                            throw std::runtime_error("Extended property exceeds its containing image");
+                        p = start + static_cast<size_t>(length);
+                    }
+                    extended_property(ni + i, p_offset, p);
                     in.seek(p);
                     break;
                 case 0x13:
@@ -920,7 +1053,6 @@ namespace nl {
             n.data.string = string;
         }
         virtual void parse_file() {
-            std::cout << "Working on " << wzfilename << std::endl;
             std::cout << "Parsing input.......";
             in.open(wzfilename);
             auto magic = in.read<uint32_t>();
@@ -998,6 +1130,7 @@ namespace nl {
             for (auto& it : links) source_fail(it, "_inlink");
             links.clear();
             std::cout << "Done!" << std::endl;
+            attach_packed_canvases();
         }
         void calculate_offsets() {
             offset = 0;
@@ -1107,8 +1240,10 @@ namespace nl {
                 raw_data_offset += raw.length;
             }
             out.seek(raw_offset);
-            for (auto const& raw : raw_binaries)
-                out.write(in.base + raw.data, raw.length);
+            for (auto const& raw : raw_binaries) {
+                if (raw.owned.empty()) out.write(in.base + raw.data, raw.length);
+                else out.write(raw.owned.data(), raw.length);
+            }
             std::cout << "Done!" << std::endl;
         }
         void write_audio() {
@@ -1143,6 +1278,7 @@ namespace nl {
                 std::string diagnostics;
                 std::exception_ptr error;
                 bool cache_hit = false;
+                bool cacheable = true;
             };
 
             std::cout << "Writing bitmaps.....";
@@ -1171,9 +1307,9 @@ namespace nl {
                     throw std::runtime_error{ "Bitmap is too large" };
                 }
                 auto format1 = in.read_cint();
-                auto format2 = static_cast<unsigned>(in.read<uint8_t>());
+                auto format2 = static_cast<unsigned>(in.read_cint());
                 auto n1 = in.read<uint32_t>();
-                if (n1) {
+                if (n1 && !b.packed) {
                     std::cout << "non-zero n1: "
                         << "0x" << std::setfill('0') << std::setw(8) << std::hex << n1;
                     throw std::runtime_error{ "Invalid bitmap header" };
@@ -1199,7 +1335,8 @@ namespace nl {
                     }
                     };
                 auto hash_value = [&](auto const& value) { hash_bytes(&value, sizeof(value)); };
-                constexpr uint32_t cache_version = 4;
+                // v4 may contain checksummed blank fallbacks from failed decoding.
+                constexpr uint32_t cache_version = 5;
                 auto high_compression = static_cast<uint8_t>(hc);
                 auto key_id = static_cast<uint8_t>(3);
                 for (auto i = 0u; i < std::size(keys); ++i) {
@@ -1300,26 +1437,35 @@ namespace nl {
                 std::vector<uint8_t> output(biggest);
                 std::ostringstream diagnostics;
                 auto decompressed = 0;
-                auto decompress = [&] {
+                struct inflate_result {
+                    int status = Z_STREAM_ERROR;
+                    uLong total_in = 0;
+                    uLong total_out = 0;
+                    std::string message;
+                };
+                auto decompress = [&](inflate_result& result) {
                     z_stream strm = {};
                     strm.next_in = input.data();
                     strm.avail_in = length;
-                    auto init_status = inflateInit(&strm);
-                    if (init_status != Z_OK) {
-                        diagnostics << "zlib init error of " << std::dec << init_status << std::endl;
-                        return false;
-                    }
+                    result.status = inflateInit(&strm);
+                    if (result.status != Z_OK) return false;
                     strm.next_out = output.data();
                     strm.avail_out = static_cast<unsigned>(expected);
-                    auto err = inflate(&strm, Z_FINISH);
-                    decompressed = static_cast<int>(strm.total_out);
+                    result.status = inflate(&strm, Z_FINISH);
+                    result.total_in = strm.total_in;
+                    result.total_out = strm.total_out;
+                    if (strm.msg) result.message = strm.msg;
                     inflateEnd(&strm);
-                    if (static_cast<size_t>(decompressed) != expected
-                        || (err != Z_STREAM_END && err != Z_BUF_ERROR)) {
-                        if (err != Z_DATA_ERROR)
-                            diagnostics << "zlib error of " << std::dec << err << std::endl;
-                        return false;
-                    }
+
+                    auto output_complete = result.total_out == expected;
+                    auto complete_stream = output_complete
+                        && (result.status == Z_STREAM_END || result.status == Z_BUF_ERROR);
+                    auto complete_legacy_stream = output_complete
+                        && result.status == Z_DATA_ERROR
+                        && result.total_in == length
+                        && result.message == "invalid block type";
+                    if (!complete_stream && !complete_legacy_stream) return false;
+                    decompressed = static_cast<int>(result.total_out);
                     return true;
                     };
                 auto decrypt = [&] {
@@ -1344,12 +1490,37 @@ namespace nl {
                     };
 
                 std::copy(job.original, job.original + length, input.begin());
-                if (!decompress() && (!decrypt() || !decompress())) {
+                auto direct_length = length;
+                inflate_result direct_result;
+                auto inflated = decompress(direct_result);
+                inflate_result decrypted_result;
+                auto attempted_decrypted_inflate = false;
+                if (!inflated && decrypt()) {
+                    attempted_decrypted_inflate = true;
+                    inflated = decompress(decrypted_result);
+                }
+                if (!inflated) {
                     auto first = job.length > 0 ? static_cast<unsigned>(job.original[0]) : 0;
                     auto second = job.length > 1 ? static_cast<unsigned>(job.original[1]) : 0;
                     diagnostics << "Unable to inflate: 0x" << std::setfill('0') << std::setw(2)
                         << std::hex << first << " 0x" << std::setw(2) << second << std::dec
-                        << std::endl;
+                        << " index=" << job.index << " size=" << job.width << 'x' << job.height
+                        << " format=" << job.format1 << ',' << job.format2
+                        << " length=" << job.length
+                        << " direct=" << direct_result.status << '(' << direct_result.total_in
+                        << '/' << direct_length << ',' << direct_result.total_out << '/' << expected
+                        << ')';
+                    if (!direct_result.message.empty())
+                        diagnostics << " [" << direct_result.message << ']';
+                    if (attempted_decrypted_inflate) {
+                        diagnostics << " decrypted=" << decrypted_result.status << '('
+                            << decrypted_result.total_in << '/' << length << ','
+                            << decrypted_result.total_out << '/' << expected << ')';
+                        if (!decrypted_result.message.empty())
+                            diagnostics << " [" << decrypted_result.message << ']';
+                    }
+                    diagnostics << std::endl;
+                    result.cacheable = false;
                     format1 = 2;
                     format2 = 0;
                     format = 2;
@@ -1486,13 +1657,14 @@ namespace nl {
                     last_percent = std::numeric_limits<unsigned>::max();
                 }
                 auto final_size = static_cast<uint32_t>(result.compressed.size());
-                if (!result.cache_hit && cache_enabled) {
+                if (!result.cache_hit && result.cacheable && cache_enabled) {
                     std::ofstream cache_file(
                         jobs[index].cache_path, std::ios::binary | std::ios::trunc);
                     if (cache_file) {
                         constexpr uint32_t magic = 0x32434C4E;
-                        auto checksum = crc32(0, Z_NULL, 0);
-                        checksum = crc32(checksum, result.compressed.data(), final_size);
+                        uint32_t checksum = static_cast<uint32_t>(crc32(0, Z_NULL, 0));
+                        checksum = static_cast<uint32_t>(
+                            crc32(checksum, result.compressed.data(), final_size));
                         cache_file.write(reinterpret_cast<char const*>(&magic), sizeof(magic));
                         cache_file.write(reinterpret_cast<char const*>(&final_size), sizeof(final_size));
                         cache_file.write(reinterpret_cast<char const*>(&checksum), sizeof(checksum));
@@ -1603,16 +1775,25 @@ namespace nl {
             wzfilename = u8string(filename);
             nxfilename = u8string(filename.replace_extension(".nx"));
             cache_directory = cache_root / ".NoLifeWzToNx.cache";
-            if (!std::ifstream{ wzfilename }.is_open()) { return; }
+            if (!std::ifstream{ wzfilename }.is_open()) {
+                skip = true;
+                std::cerr << "Skipping unreadable input [" << wzfilename << ']'
+                    << std::endl;
+                return;
+            }
             if (std::ifstream{ nxfilename }.good()) {
                 skip = true;
-                std::cout << nxfilename << " exist. Skip!" << std::endl;
+                std::cout << "Skipping existing output [" << wzfilename << "] -> ["
+                    << nxfilename << ']' << std::endl;
+                return;
             }
-            std::cout << wzfilename << " -> " << nxfilename << std::endl;
         }
 
         void convert_file() {
             if (skip) return;
+            auto kind = u8string(sys::path{ wzfilename }.extension()) == ".img" ? "IMG" : "WZ";
+            std::cout << "Converting " << kind << " [" << wzfilename << "] -> ["
+                << nxfilename << ']' << std::endl;
             parse_file();
             open_output();
             write_nodes();
@@ -1622,6 +1803,8 @@ namespace nl {
                 write_audio();
                 write_bitmaps();
             }
+            std::cout << "Completed " << kind << " [" << wzfilename << ']'
+                << std::endl;
         }
     };
 
@@ -1711,12 +1894,12 @@ Converts WZ files into NX files
         else if (sys::is_directory(p)) {
           for (sys::recursive_directory_iterator it{p}, end{}; it != end;
                ++it) {
-            if (it->is_directory()
-                && it->path().filename() == ".NoLifeWzToNx.cache") {
-                it.disable_recursion_pending();
+            if (it->is_directory()) {
+                if (it->path().filename() == ".NoLifeWzToNx.cache")
+                    it.disable_recursion_pending();
                 continue;
             }
-            convert(*it, p);
+            if (it->is_regular_file()) convert(it->path(), p);
           }
         }
     }
