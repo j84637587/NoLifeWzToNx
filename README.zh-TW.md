@@ -112,6 +112,8 @@ x64\Debug\NoLifeWzToNx.exe "F:\path\to\file.wz" -c -h --threads 8
 
 至少必須提供一個輸入檔案或資料夾。轉換器會將 NX 檔案寫入來源 WZ 或 IMG 檔案所在的資料夾。如果目的 NX 檔案已存在，該檔案會被跳過。
 
+以 Client 模式轉換資料夾時，程式會先掃描所有 WZ 並建立全域 bitmap registry，再開始輸出 NX。`source` 可以直接從其他 WZ 或其數字分卷取得 bitmap，不依賴 NX 產生順序。若只指定單一 WZ，registry 只包含命令列提供的 WZ；需要跨檔解析時，請輸入整個資料夾或同時列出相依的 WZ 檔案。
+
 Client bitmap 的壓縮結果會快取在共用的 `.NoLifeWzToNx.cache` 目錄。輸入資料夾時，只會在指定的根目錄建立一份 cache，供所有遞迴轉換的 WZ/IMG 共用；輸入單一檔案時，則在該檔案旁建立 cache。即使輸入檔名不同，也能重用未變更 bitmap 的 LZ4 資料。bitmap 進度列會顯示完成數、百分比、快取命中數與本次實際壓縮數；bitmap 內容、壓縮模式或格式變更時會自動使用不同的快取項目。
 
 ## 日常轉換: 只保留兩版 NX

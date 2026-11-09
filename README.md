@@ -112,6 +112,8 @@ Command-line options:
 
 At least one input file or directory must be provided. The converter writes each NX file next to its source WZ or IMG file. If the destination NX file already exists, that file is skipped.
 
+For a client directory conversion, the converter scans every WZ and builds a global bitmap registry before writing any NX files. A `source` can therefore obtain its bitmap directly from another WZ or numbered split without depending on NX output order. When only one WZ is provided, the registry contains only the WZ files listed on the command line; provide the directory or list the required WZ files together when cross-file resolution is needed.
+
 Client bitmap compression results are cached in a shared `.NoLifeWzToNx.cache` directory. For a directory input, one cache is created at the specified root and shared by all recursively converted WZ/IMG files; for a single-file input, the cache is created next to that file. Unchanged bitmaps are reused even when the input filename changes. The bitmap progress line shows the completed count, percentage, cache hits, and images compressed during the current run. A changed bitmap, compression mode, or bitmap format automatically uses a separate cache entry.
 
 ## Daily conversion: keep only two NX generations
