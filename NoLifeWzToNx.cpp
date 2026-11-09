@@ -1335,7 +1335,8 @@ namespace nl {
                     }
                     };
                 auto hash_value = [&](auto const& value) { hash_bytes(&value, sizeof(value)); };
-                constexpr uint32_t cache_version = 4;
+                // v4 may contain checksummed blank fallbacks from failed decoding.
+                constexpr uint32_t cache_version = 5;
                 auto high_compression = static_cast<uint8_t>(hc);
                 auto key_id = static_cast<uint8_t>(3);
                 for (auto i = 0u; i < std::size(keys); ++i) {
@@ -1661,8 +1662,9 @@ namespace nl {
                         jobs[index].cache_path, std::ios::binary | std::ios::trunc);
                     if (cache_file) {
                         constexpr uint32_t magic = 0x32434C4E;
-                        auto checksum = crc32(0, Z_NULL, 0);
-                        checksum = crc32(checksum, result.compressed.data(), final_size);
+                        uint32_t checksum = static_cast<uint32_t>(crc32(0, Z_NULL, 0));
+                        checksum = static_cast<uint32_t>(
+                            crc32(checksum, result.compressed.data(), final_size));
                         cache_file.write(reinterpret_cast<char const*>(&magic), sizeof(magic));
                         cache_file.write(reinterpret_cast<char const*>(&final_size), sizeof(final_size));
                         cache_file.write(reinterpret_cast<char const*>(&checksum), sizeof(checksum));
