@@ -55,6 +55,7 @@
 #include <exception>
 
 #include <limits>
+#include <memory>
 #include <mutex>
 #ifndef NL_NO_CODECVT
 #include <codecvt>
@@ -77,6 +78,7 @@ namespace sys = std::filesystem;
 #include <optional>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <sstream>
 
@@ -364,6 +366,182 @@ namespace nl {
         uint8_t const* key;
         bool packed = false;
         uint32_t packed_raw = 0;
+        imapfile* input = nullptr;
+    };
+    uint32_t compute_version_hash(int version) {
+        uint32_t hash = 0;
+        for (auto c : std::to_string(version))
+            hash = hash * 32 + static_cast<uint8_t>(c) + 1;
+        return hash;
+    }
+    uint8_t derive_header_byte(uint32_t hash) {
+        return static_cast<uint8_t>(~(
+            ((hash >> 24) & 0xff) ^ ((hash >> 16) & 0xff)
+            ^ ((hash >> 8) & 0xff) ^ (hash & 0xff)));
+    }
+    struct nx_bitmap {
+        uint16_t width;
+        uint16_t height;
+        uint8_t const* compressed;
+        uint32_t compressed_size;
+    };
+    struct imported_bitmap_ref {
+        uint32_t id;
+        uint16_t width;
+        uint16_t height;
+    };
+    struct nxfile {
+        imapfile in;
+        uint32_t node_count = 0;
+        uint64_t node_offset = 0;
+        uint32_t string_count = 0;
+        uint64_t string_table_offset = 0;
+        uint32_t bitmap_count = 0;
+        uint64_t bitmap_table_offset = 0;
+
+        template <typename T>
+        T read_at(uint64_t position) const {
+            if (position > in.file_size || sizeof(T) > in.file_size - position)
+                throw std::runtime_error("Invalid NX offset");
+            T value;
+            std::memcpy(&value, in.base + position, sizeof(value));
+            return value;
+        }
+
+        explicit nxfile(std::string const& filename) {
+            in.open(filename);
+            if (read_at<uint32_t>(0) != 0x34474B50)
+                throw std::runtime_error("Invalid NX header in " + filename);
+            node_count = read_at<uint32_t>(4);
+            node_offset = read_at<uint64_t>(8);
+            string_count = read_at<uint32_t>(16);
+            string_table_offset = read_at<uint64_t>(20);
+            bitmap_count = read_at<uint32_t>(28);
+            bitmap_table_offset = read_at<uint64_t>(32);
+            if (node_offset > in.file_size
+                || static_cast<uint64_t>(node_count) * sizeof(node) > in.file_size - node_offset
+                || string_table_offset > in.file_size
+                || static_cast<uint64_t>(string_count) * sizeof(uint64_t)
+                    > in.file_size - string_table_offset
+                || bitmap_table_offset > in.file_size
+                || static_cast<uint64_t>(bitmap_count) * sizeof(uint64_t)
+                    > in.file_size - bitmap_table_offset) {
+                throw std::runtime_error("Invalid NX tables in " + filename);
+            }
+        }
+
+        node get_node(id_t id) const {
+            if (id >= node_count) throw std::runtime_error("Invalid NX node id");
+            return read_at<node>(node_offset + static_cast<uint64_t>(id) * sizeof(node));
+        }
+
+        std::string get_string(uint32_t id) const {
+            if (id >= string_count) throw std::runtime_error("Invalid NX string id");
+            auto position = read_at<uint64_t>(
+                string_table_offset + static_cast<uint64_t>(id) * sizeof(uint64_t));
+            auto length = read_at<uint16_t>(position);
+            position += sizeof(uint16_t);
+            if (position > in.file_size || length > in.file_size - position)
+                throw std::runtime_error("Invalid NX string");
+            return std::string(in.base + position, length);
+        }
+
+        std::optional<id_t> get_child(id_t parent, std::string const& name) const {
+            auto n = get_node(parent);
+            auto first = static_cast<uint64_t>(n.children);
+            auto count = static_cast<uint64_t>(n.num);
+            if (first > node_count || count > node_count - first)
+                throw std::runtime_error("Invalid NX child range");
+            for (auto i = 0u; i < n.num; ++i) {
+                auto id = static_cast<id_t>(n.children + i);
+                auto child = get_node(id);
+                auto child_name = get_string(child.name);
+                if (child_name == name) return id;
+                if (child_name > name) break;
+            }
+            return std::nullopt;
+        }
+
+        bool find_bitmap(std::vector<std::string> const& parts, size_t first,
+            nx_bitmap& result) const {
+            id_t current = 0;
+            for (auto i = first; i < parts.size(); ++i) {
+                auto child = get_child(current, parts[i]);
+                if (!child) return false;
+                current = *child;
+            }
+            auto n = get_node(current);
+            if (n.data_type != node::type::bitmap || n.data.bitmap.id >= bitmap_count)
+                return false;
+            auto position = read_at<uint64_t>(bitmap_table_offset
+                + static_cast<uint64_t>(n.data.bitmap.id) * sizeof(uint64_t));
+            auto length = read_at<uint32_t>(position);
+            position += sizeof(uint32_t);
+            if (length == 0 || position > in.file_size || length > in.file_size - position)
+                throw std::runtime_error("Invalid NX bitmap data");
+            result.width = n.data.bitmap.width;
+            result.height = n.data.bitmap.height;
+            result.compressed = reinterpret_cast<uint8_t const*>(in.base + position);
+            result.compressed_size = length;
+            return true;
+        }
+    };
+    struct wz_bitmap_source {
+        std::string filename;
+        uint64_t data;
+        uint8_t key_id;
+        uint16_t width;
+        uint16_t height;
+        std::optional<std::string> source;
+    };
+    struct wz_registry {
+        std::unordered_map<std::string, wz_bitmap_source> bitmaps;
+        std::map<std::string, std::unique_ptr<imapfile>> files;
+
+        bool add(std::string path, wz_bitmap_source source) {
+            return bitmaps.emplace(std::move(path), std::move(source)).second;
+        }
+
+        bool resolve(std::string const& path, wz_bitmap_source& result) const {
+            std::unordered_set<std::string> visited;
+            auto current = path;
+            for (;;) {
+                auto found = bitmaps.find(current);
+                if (found == bitmaps.end()) return false;
+                if (!visited.insert(current).second) {
+                    result = found->second;
+                    return true;
+                }
+                if (!found->second.source) {
+                    result = found->second;
+                    return true;
+                }
+                auto target = bitmaps.find(*found->second.source);
+                if (target == bitmaps.end()) {
+                    result = found->second;
+                    return true;
+                }
+                current = *found->second.source;
+            }
+        }
+
+        imapfile* open(std::string const& filename) {
+            auto found = files.find(filename);
+            if (found != files.end()) return found->second.get();
+            try {
+                auto input = std::make_unique<imapfile>();
+                input->open(filename);
+                auto result = input.get();
+                files.emplace(filename, std::move(input));
+                return result;
+            }
+            catch (std::exception const& error) {
+                std::cerr << "Unable to read registered WZ [" << filename << "]: "
+                    << error.what() << std::endl;
+                files.emplace(filename, nullptr);
+                return nullptr;
+            }
+        }
     };
     struct raw_binary {
         uint32_t length;
@@ -388,21 +566,29 @@ namespace nl {
         char16_t const* u16key = nullptr;
         std::vector<std::pair<id_t, int32_t>> imgs;
         size_t file_start = 0;
+        bool new_wz_format = false;
         std::vector<id_t> uol_path;
         std::vector<std::vector<id_t>> uols;
         std::vector<id_t> link_path;
         std::vector<std::vector<id_t>> links;
         std::vector<bitmap> bitmaps;
+        std::map<uint32_t, nx_bitmap> imported_bitmaps;
+        std::unordered_map<std::string, imported_bitmap_ref> imported_bitmap_ids;
+        std::map<std::string, std::unique_ptr<nxfile>> external_nx_files;
+        std::unordered_map<std::string, std::vector<std::string>> external_nx_candidates;
+        std::unordered_set<id_t> external_sources_resolved;
+        wz_registry* registry = nullptr;
         std::vector<audio> audios;
         std::vector<raw_binary> raw_binaries;
         size_t current_image_end = 0;
         size_t offset, node_offset, string_offset, string_table_offset, bitmap_offset,
             bitmap_table_offset, audio_offset, audio_table_offset, raw_offset, raw_table_offset;
         bool client, hc;
-        std::string wzfilename, nxfilename;
+        std::string wzfilename, nxfilename, wz_category;
         sys::path cache_directory;
         unsigned threads;
         bool skip = false;
+        bool index_only = false;
         // Methods
         std::string convert_str(std::u16string const& p_str) {
 #ifndef NL_NO_CODECVT
@@ -461,6 +647,7 @@ namespace nl {
                 }
                 if (std::any_of(str_buf.begin(), str_buf.end(),
                     [](char const& c) { return static_cast<uint8_t>(c) >= 0x80; })) {
+                    wstr_buf.clear();
                     std::transform(str_buf.cbegin(), str_buf.cend(), std::back_inserter(wstr_buf),
                         [](char c) { return cp1252[static_cast<unsigned char>(c)]; });
                     return add_string(convert_str(wstr_buf));
@@ -572,6 +759,55 @@ namespace nl {
             if (strings[it->name] != str) return 0;
             return static_cast<id_t>(it - nodes.begin());
         }
+        std::vector<std::string> const& get_external_nx_candidates(
+            std::string const& category) {
+            auto found = external_nx_candidates.find(category);
+            if (found != external_nx_candidates.end()) return found->second;
+
+            std::vector<std::string> candidates;
+            auto directory = sys::path{ wzfilename }.parent_path();
+            std::error_code error;
+            for (sys::directory_iterator it{ directory, error }, end; !error && it != end;
+                it.increment(error)) {
+                if (!it->is_regular_file(error) || it->path().extension() != ".nx") continue;
+                auto stem = u8string(it->path().stem());
+                if (stem.compare(0, category.size(), category) != 0) continue;
+                auto suffix = stem.substr(category.size());
+                auto numeric_suffix = !suffix.empty()
+                    && std::all_of(suffix.begin(), suffix.end(), [](char c) {
+                        return c >= '0' && c <= '9';
+                        });
+                auto version_suffix = suffix.size() > 2 && suffix[0] == '_'
+                    && suffix[1] == 'v'
+                    && std::all_of(suffix.begin() + 2, suffix.end(), [](char c) {
+                        return c >= '0' && c <= '9';
+                        });
+                if (!suffix.empty() && !numeric_suffix && !version_suffix) continue;
+                candidates.push_back(u8string(it->path()));
+            }
+            std::sort(candidates.begin(), candidates.end(), [&category](std::string const& a,
+                std::string const& b) {
+                auto a_stem = u8string(sys::path{ a }.stem());
+                auto b_stem = u8string(sys::path{ b }.stem());
+                if ((a_stem == category) != (b_stem == category)) return a_stem == category;
+                return a_stem < b_stem;
+                });
+            return external_nx_candidates.emplace(category, std::move(candidates)).first->second;
+        }
+        nxfile* get_external_nx(std::string const& filename) {
+            auto found = external_nx_files.find(filename);
+            if (found != external_nx_files.end()) return found->second.get();
+            try {
+                return external_nx_files.emplace(filename,
+                    std::make_unique<nxfile>(filename)).first->second.get();
+            }
+            catch (std::exception const& error) {
+                std::cerr << "Unable to read external NX [" << filename << "]: "
+                    << error.what() << std::endl;
+                external_nx_files.emplace(filename, nullptr);
+                return nullptr;
+            }
+        }
         bool resolve_uol(std::vector<id_t> uol) {
             auto& n = nodes[uol.back()];
             uol.pop_back();
@@ -597,6 +833,7 @@ namespace nl {
             return true;
         }
         bool resolve_source(std::vector<id_t> link) {
+            auto source_node = link.back();
             auto& n = nodes[link.back()];
             link.pop_back();
             auto& s = strings[n.data.string];
@@ -605,10 +842,68 @@ namespace nl {
             std::string segment;
             while (std::getline(stream, segment, '/'))
                 parts.push_back(segment);
-            id_t r = 0;
-            for (auto const& part : parts)
-                r = get_child_full(r, part);
-            if (r == 0) return false;
+            if (parts.empty()) return false;
+
+            auto find_source = [this, &parts](size_t first) {
+                id_t result = 0;
+                for (auto i = first; i < parts.size(); ++i) {
+                    result = get_child_full(result, parts[i]);
+                    if (result == 0) return id_t{ 0 };
+                }
+                return result;
+            };
+
+            auto first = parts.size() > 1 && parts.front() == wz_category ? 1u : 0u;
+            auto r = find_source(first);
+            if (r == 0) {
+                if (!client || parts.size() < 2) return false;
+                auto& pn = nodes[link.back()];
+                if (pn.data_type != node::type::bitmap) return false;
+                auto imported = imported_bitmap_ids.find(s);
+                if (imported == imported_bitmap_ids.end()) {
+                    if (registry != nullptr) {
+                        wz_bitmap_source source;
+                        if (registry->resolve(s, source)) {
+                            auto input = registry->open(source.filename);
+                            if (input != nullptr && source.key_id < std::size(keys)) {
+                                auto id = static_cast<uint32_t>(bitmaps.size());
+                                bitmaps.push_back({
+                                    source.data, keys[source.key_id], false, 0, input });
+                                preserve_packed_bitmap(id, input->file_size);
+                                imported = imported_bitmap_ids.emplace(s, imported_bitmap_ref{
+                                    id, source.width, source.height }).first;
+                            }
+                        }
+                    }
+                    if (imported == imported_bitmap_ids.end()) {
+                        nx_bitmap external_bitmap;
+                        auto external_found = false;
+                        for (auto const& filename : get_external_nx_candidates(parts.front())) {
+                            if (sys::path{ filename }.lexically_normal()
+                                == sys::path{ nxfilename }.lexically_normal()) {
+                                continue;
+                            }
+                            auto external = get_external_nx(filename);
+                            if (external != nullptr
+                                && external->find_bitmap(parts, 1, external_bitmap)) {
+                                external_found = true;
+                                break;
+                            }
+                        }
+                        if (!external_found) return false;
+                        auto id = static_cast<uint32_t>(bitmaps.size());
+                        bitmaps.push_back({ 0, nullptr });
+                        imported_bitmaps.emplace(id, external_bitmap);
+                        imported = imported_bitmap_ids.emplace(s, imported_bitmap_ref{
+                            id, external_bitmap.width, external_bitmap.height }).first;
+                    }
+                }
+                pn.data.bitmap.id = imported->second.id;
+                pn.data.bitmap.width = imported->second.width;
+                pn.data.bitmap.height = imported->second.height;
+                external_sources_resolved.insert(source_node);
+                return true;
+            }
             auto& nr = nodes[r];
             auto& pn = nodes[link.back()];
             pn.data = nr.data;
@@ -697,7 +992,7 @@ namespace nl {
                 {
                     auto s = in.read<int32_t>();
                     auto p = in.tell();
-                    in.seek(file_start + s);
+                    in.seek(file_start + s + (new_wz_format ? 1 : 0));
                     type = in.read<uint8_t>();
                     nn.name = read_enc_string();
                     in.seek(p);
@@ -852,51 +1147,56 @@ namespace nl {
             }
             else { throw std::runtime_error("Unknown sub property type: " + st); }
         }
-        void preserve_packed_canvas(id_t prop_node, size_t property_end) {
-            if (!client) return;
-            const auto saved = in.tell();
-            const auto bitmap_id = nodes[prop_node].data.bitmap.id;
-            const auto end = property_end ? property_end : current_image_end;
+        void preserve_packed_bitmap(uint32_t bitmap_id, size_t end) {
+            auto& bitmap = bitmaps[bitmap_id];
+            auto& bitmap_input = bitmap.input == nullptr ? in : *bitmap.input;
+            const auto saved = bitmap_input.tell();
             auto available = [&](size_t size) {
-                if (in.tell() > end || size > end - in.tell())
+                if (bitmap_input.tell() > end || size > end - bitmap_input.tell())
                     throw std::runtime_error("Packed canvas exceeds its property");
             };
             auto cint = [&]() -> int32_t {
                 available(1);
-                const auto value = in.read<int8_t>();
+                const auto value = bitmap_input.read<int8_t>();
                 if (value != -128) return value;
                 available(4);
-                return in.read<int32_t>();
+                return bitmap_input.read<int32_t>();
             };
-            in.seek(bitmaps[bitmap_id].data);
+            bitmap_input.seek(bitmap.data);
             const auto width = cint();
             const auto height = cint();
             // format2 is a compressed integer, not always a single byte.
             const auto format1 = cint();
             const auto format2 = cint();
             if (int64_t(format1) + int64_t(format2) * 256 != nx_texture::kFormat) {
-                in.seek(saved);
+                bitmap_input.seek(saved);
                 return;
             }
             if (width <= 0 || height <= 0 || width > 65535 || height > 65535)
                 throw std::runtime_error("Invalid packed canvas dimensions");
             available(9);
-            const auto stored_pages = in.read<uint32_t>();
-            const auto length = in.read<uint32_t>();
-            const auto marker = in.read<uint8_t>();
+            const auto stored_pages = bitmap_input.read<uint32_t>();
+            const auto length = bitmap_input.read<uint32_t>();
+            const auto marker = bitmap_input.read<uint8_t>();
             if (!length || marker != 0)
                 throw std::runtime_error("Invalid packed canvas pixel length or marker");
             available(length - 1);
             auto payload = nx_texture::encode(
-                reinterpret_cast<const uint8_t*>(in.base + in.tell()), length - 1,
-                bitmaps[bitmap_id].key, width, height, stored_pages ? stored_pages : 1);
+                reinterpret_cast<const uint8_t*>(bitmap_input.base + bitmap_input.tell()),
+                length - 1, bitmap.key, width, height, stored_pages ? stored_pages : 1);
             if (raw_binaries.size() >= UINT32_MAX)
                 throw std::runtime_error("NX raw binary table is too large");
             const auto raw_id = static_cast<uint32_t>(raw_binaries.size());
             raw_binaries.push_back({static_cast<uint32_t>(payload.size()), 0, std::move(payload)});
-            bitmaps[bitmap_id].packed = true;
-            bitmaps[bitmap_id].packed_raw = raw_id;
-            in.seek(saved);
+            bitmap.packed = true;
+            bitmap.packed_raw = raw_id;
+            bitmap_input.seek(saved);
+        }
+
+        void preserve_packed_canvas(id_t prop_node, size_t property_end) {
+            if (!client || index_only) return;
+            const auto end = property_end ? property_end : current_image_end;
+            preserve_packed_bitmap(nodes[prop_node].data.bitmap.id, end);
         }
 
         void attach_packed_canvases() {
@@ -1047,31 +1347,135 @@ namespace nl {
             for (auto i = 0u; i < slen; ++i) {
                 str_buf[i] = static_cast<char8_t>(os[i] ^ u8key[i]);
             }
+            in.skip(slen);
             auto string = add_string(str_buf);
             auto& n = nodes[script_node];
             n.data_type = node::type::string;
             n.data.string = string;
         }
-        virtual void parse_file() {
-            std::cout << "Parsing input.......";
+        size_t detect_directory_start() {
+            if (file_start >= in.file_size)
+                throw std::runtime_error("Invalid WZ data offset");
+            auto position = file_start;
+            auto first = static_cast<int8_t>(in.base[position++]);
+            auto count = static_cast<int32_t>(first);
+            if (first == -128) {
+                if (position > in.file_size || sizeof(count) > in.file_size - position)
+                    throw std::runtime_error("Invalid WZ directory count");
+                std::memcpy(&count, in.base + position, sizeof(count));
+                position += sizeof(count);
+            }
+            if (position >= in.file_size)
+                throw std::runtime_error("Missing WZ directory type");
+            auto type = static_cast<uint8_t>(in.base[position]);
+            new_wz_format = count > 0 && type >= 1 && type <= 4;
+            auto directory_start = file_start + (new_wz_format ? 0 : 2);
+            if (directory_start >= in.file_size)
+                throw std::runtime_error("Invalid WZ directory offset");
+            return directory_start;
+        }
+        void detect_version() {
+            in.open(wzfilename);
+            if (in.read<uint32_t>() != 0x31474B50)
+                throw std::runtime_error("Not a valid WZ file");
+            in.skip(8);
+            file_start = in.read<uint32_t>();
+            if (file_start > in.file_size || sizeof(uint16_t) > in.file_size - file_start)
+                throw std::runtime_error("Invalid WZ data offset");
+            uint16_t first_bytes;
+            std::memcpy(&first_bytes, in.base + file_start, sizeof(first_bytes));
+            detect_directory_start();
+
+            std::cout << "File: " << wzfilename << '\n'
+                << "Data offset: 0x" << std::hex << file_start << std::dec << '\n';
+            if (new_wz_format) {
+                std::cout << "Format: New (no version hash)\n"
+                    << "Version: Cannot be determined from file\n\n";
+                return;
+            }
+            std::cout << "Format: Legacy (with version hash)\n"
+                << "Version hash: 0x" << std::hex << first_bytes << std::dec << '\n';
+            std::vector<int> candidates;
+            auto header_byte = static_cast<uint8_t>(first_bytes & 0xff);
+            for (auto version = 0; version < 1000; ++version) {
+                if (derive_header_byte(compute_version_hash(version)) == header_byte)
+                    candidates.push_back(version);
+            }
+            std::cout << "Version candidates:";
+            if (candidates.empty()) std::cout << " none";
+            for (auto candidate : candidates) std::cout << " v" << candidate;
+            std::cout << "\n\n";
+        }
+        void parse_wz_input(bool show_progress) {
+            if (show_progress) std::cout << "Parsing input.......";
             in.open(wzfilename);
             auto magic = in.read<uint32_t>();
             if (magic != 0x31474B50)
               throw std::runtime_error("Not a valid WZ file");
             in.skip(8);
             file_start = in.read<uint32_t>();
-            // Just skip the copyright string
-            in.seek(file_start + 2);
+            auto directory_start = detect_directory_start();
+            in.seek(directory_start);
             in.read_cint();
             in.skip(1);
             deduce_key();
-            in.seek(file_start + 2);
+            in.seek(directory_start);
             add_string({});
             directory(0);
             for (auto &it : imgs)
               img(it.first, it.second);
-            std::cout << "Done!" << std::endl;
+            if (show_progress) std::cout << "Done!" << std::endl;
+        }
+        virtual void parse_file() {
+            parse_wz_input(true);
             finish_parse();
+        }
+        size_t index_registry(wz_registry& target) {
+            index_only = true;
+            parse_wz_input(false);
+            auto count = size_t{ 0 };
+            auto path = wz_category == "Base" ? std::string{} : wz_category;
+            auto visit = [&](auto&& self, id_t id) -> void {
+                auto old_size = path.size();
+                auto const& n = nodes[id];
+                if (id != 0) {
+                    if (!path.empty()) path.push_back('/');
+                    path += strings[n.name];
+                }
+                if (n.data_type == node::type::bitmap
+                    && n.data.bitmap.id < bitmaps.size()) {
+                    auto const& b = bitmaps[n.data.bitmap.id];
+                    auto key_id = static_cast<uint8_t>(std::size(keys));
+                    for (auto i = 0u; i < std::size(keys); ++i) {
+                        if (b.key == keys[i]) key_id = static_cast<uint8_t>(i);
+                    }
+                    if (key_id < std::size(keys)) {
+                        std::optional<std::string> source;
+                        for (auto i = 0u; i < n.num; ++i) {
+                            auto const& child = nodes[n.children + i];
+                            if (strings[child.name] == "source"
+                                && child.data_type == node::type::string) {
+                                source = strings[child.data.string];
+                                break;
+                            }
+                        }
+                        if (target.add(path, wz_bitmap_source{
+                            wzfilename,
+                            b.data,
+                            key_id,
+                            n.data.bitmap.width,
+                            n.data.bitmap.height,
+                            std::move(source)
+                            })) {
+                            ++count;
+                        }
+                    }
+                }
+                for (auto i = 0u; i < n.num; ++i) self(self, n.children + i);
+                path.resize(old_size);
+                };
+            visit(visit, 0);
+            return count;
         }
         void finish_parse() {
             for (auto const& n : nodes_to_sort) sort_nodes(n.first, n.second);
@@ -1091,6 +1495,7 @@ namespace nl {
             //source
             std::cout << "Parsing source......";
             find_links(0, "source");
+            auto source_links = links;
             for (;;) {
                 auto it = std::remove_if(links.begin(), links.end(), [this](std::vector<id_t> const& v) {
                     return resolve_source(v);
@@ -1099,8 +1504,26 @@ namespace nl {
                 links.erase(it, links.end());
                 if (diff == 0) break;
             }
+            for (auto pass = 0u; pass < source_links.size(); ++pass) {
+                auto changed = false;
+                for (auto const& source_link : source_links) {
+                    if (source_link.size() < 2) continue;
+                    auto& parent = nodes[source_link[source_link.size() - 2]];
+                    auto old_type = parent.data_type;
+                    auto old_data = parent.data;
+                    if (resolve_source(source_link)
+                        && (parent.data_type != old_type
+                            || std::memcmp(&parent.data, &old_data, sizeof(old_data)) != 0)) {
+                        changed = true;
+                    }
+                }
+                if (!changed) break;
+            }
             for (auto& it : links) source_fail(it, "source");
             links.clear();
+            if (!external_sources_resolved.empty())
+                std::cout << "Resolved " << external_sources_resolved.size()
+                    << " external source(s). ";
             std::cout << "Done!" << std::endl;
             //_outlink
             std::cout << "Parsing _outlink....";
@@ -1262,6 +1685,7 @@ namespace nl {
         void write_bitmaps() {
             struct bitmap_job {
                 size_t index;
+                uint8_t const* imported;
                 int width;
                 int height;
                 int format1;
@@ -1293,82 +1717,103 @@ namespace nl {
             jobs.reserve(bitmaps.size());
             auto last_index_percent = std::numeric_limits<unsigned>::max();
             for (auto index = 0u; index < bitmaps.size(); ++index) {
-                auto& b = bitmaps[index];
-                in.seek(b.data);
-                auto width = in.read_cint();
-                auto height = in.read_cint();
-                if (width < 0 || height < 0) {
-                    std::cout << "Invalid image size: " << std::dec << width << ", " << height
-                        << std::endl;
-                    throw std::runtime_error{ "Invalid image size" };
+                auto imported = imported_bitmaps.find(index);
+                if (imported != imported_bitmaps.end()) {
+                    jobs.push_back({
+                        index,
+                        imported->second.compressed,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        nullptr,
+                        nullptr,
+                        imported->second.compressed_size,
+                        {}
+                        });
                 }
-                auto pixel_count = static_cast<uint64_t>(width) * static_cast<uint64_t>(height);
-                if (pixel_count > static_cast<uint64_t>(std::numeric_limits<int>::max()) / 4) {
-                    throw std::runtime_error{ "Bitmap is too large" };
-                }
-                auto format1 = in.read_cint();
-                auto format2 = static_cast<unsigned>(in.read_cint());
-                auto n1 = in.read<uint32_t>();
-                if (n1 && !b.packed) {
-                    std::cout << "non-zero n1: "
-                        << "0x" << std::setfill('0') << std::setw(8) << std::hex << n1;
-                    throw std::runtime_error{ "Invalid bitmap header" };
-                }
-                auto length = in.read<uint32_t>();
-                auto n2 = static_cast<unsigned>(in.read<uint8_t>());
-                if (n2) {
-                    std::cout << "non-zero n2: "
-                        << " 0x" << std::setfill('0') << std::setw(2) << std::hex
-                        << n2 << std::endl;
-                    throw std::runtime_error{ "Invalid bitmap header" };
-                }
-
-                auto original = reinterpret_cast<uint8_t const*>(in.offset);
-                auto key = b.key;
-                uint64_t hash1 = 14695981039346656037ull;
-                uint64_t hash2 = 1099511628211ull;
-                auto hash_bytes = [&](void const* data, size_t data_size) {
-                    auto bytes = static_cast<uint8_t const*>(data);
-                    for (size_t i = 0; i < data_size; ++i) {
-                        hash1 = (hash1 ^ bytes[i]) * 1099511628211ull;
-                        hash2 = (hash2 ^ bytes[i]) * 14029467366897019727ull;
+                else {
+                    auto& b = bitmaps[index];
+                    auto& bitmap_input = b.input == nullptr ? in : *b.input;
+                    bitmap_input.seek(b.data);
+                    auto width = bitmap_input.read_cint();
+                    auto height = bitmap_input.read_cint();
+                    if (width < 0 || height < 0) {
+                        std::cout << "Invalid image size: " << std::dec << width << ", " << height
+                            << std::endl;
+                        throw std::runtime_error{ "Invalid image size" };
                     }
-                    };
-                auto hash_value = [&](auto const& value) { hash_bytes(&value, sizeof(value)); };
-                // v4 may contain checksummed blank fallbacks from failed decoding.
-                constexpr uint32_t cache_version = 5;
-                auto high_compression = static_cast<uint8_t>(hc);
-                auto key_id = static_cast<uint8_t>(3);
-                for (auto i = 0u; i < std::size(keys); ++i) {
-                    if (key == keys[i]) key_id = static_cast<uint8_t>(i);
-                }
-                hash_value(cache_version);
-                hash_value(high_compression);
-                hash_value(key_id);
-                hash_value(width);
-                hash_value(height);
-                hash_value(format1);
-                hash_value(format2);
-                hash_value(length);
-                hash_bytes(original, length);
+                    auto pixel_count = static_cast<uint64_t>(width) * static_cast<uint64_t>(height);
+                    if (pixel_count > static_cast<uint64_t>(std::numeric_limits<int>::max()) / 4) {
+                        throw std::runtime_error{ "Bitmap is too large" };
+                    }
+                    auto format1 = bitmap_input.read_cint();
+                    auto format2 = static_cast<unsigned>(bitmap_input.read_cint());
+                    auto n1 = bitmap_input.read<uint32_t>();
+                    if (n1 && !b.packed) {
+                        std::cout << "non-zero n1: "
+                            << "0x" << std::setfill('0') << std::setw(8) << std::hex << n1;
+                        throw std::runtime_error{ "Invalid bitmap header" };
+                    }
+                    auto length = bitmap_input.read<uint32_t>();
+                    auto n2 = static_cast<unsigned>(bitmap_input.read<uint8_t>());
+                    if (n2) {
+                        std::cout << "non-zero n2: "
+                            << " 0x" << std::setfill('0') << std::setw(2) << std::hex
+                            << n2 << std::endl;
+                        throw std::runtime_error{ "Invalid bitmap header" };
+                    }
 
-                std::ostringstream cache_name;
-                cache_name << std::hex << std::setfill('0') << std::setw(16) << hash1
-                    << std::setw(16) << hash2 << ".bin";
-                auto size = static_cast<int>(pixel_count * 4);
-                jobs.push_back({
-                    index,
-                    width,
-                    height,
-                    format1,
-                    format2,
-                    size,
-                    length,
-                    original,
-                    key,
-                    static_cast<uint32_t>(LZ4_compressBound(size)),
-                    cache_directory / cache_name.str()
-                    });
+                    auto original = reinterpret_cast<uint8_t const*>(bitmap_input.offset);
+                    auto key = b.key;
+                    uint64_t hash1 = 14695981039346656037ull;
+                    uint64_t hash2 = 1099511628211ull;
+                    auto hash_bytes = [&](void const* data, size_t data_size) {
+                        auto bytes = static_cast<uint8_t const*>(data);
+                        for (size_t i = 0; i < data_size; ++i) {
+                            hash1 = (hash1 ^ bytes[i]) * 1099511628211ull;
+                            hash2 = (hash2 ^ bytes[i]) * 14029467366897019727ull;
+                        }
+                        };
+                    auto hash_value = [&](auto const& value) { hash_bytes(&value, sizeof(value)); };
+                    // v4 may contain checksummed blank fallbacks from failed decoding.
+                    constexpr uint32_t cache_version = 5;
+                    auto high_compression = static_cast<uint8_t>(hc);
+                    auto key_id = static_cast<uint8_t>(3);
+                    for (auto i = 0u; i < std::size(keys); ++i) {
+                        if (key == keys[i]) key_id = static_cast<uint8_t>(i);
+                    }
+                    hash_value(cache_version);
+                    hash_value(high_compression);
+                    hash_value(key_id);
+                    hash_value(width);
+                    hash_value(height);
+                    hash_value(format1);
+                    hash_value(format2);
+                    hash_value(length);
+                    hash_bytes(original, length);
+
+                    std::ostringstream cache_name;
+                    cache_name << std::hex << std::setfill('0') << std::setw(16) << hash1
+                        << std::setw(16) << hash2 << ".bin";
+                    auto size = static_cast<int>(pixel_count * 4);
+                    jobs.push_back({
+                        index,
+                        nullptr,
+                        width,
+                        height,
+                        format1,
+                        format2,
+                        size,
+                        length,
+                        original,
+                        key,
+                        static_cast<uint32_t>(LZ4_compressBound(size)),
+                        cache_directory / cache_name.str()
+                        });
+                }
                 auto index_percent = static_cast<unsigned>((index + 1) * 100 / bitmaps.size());
                 if (index_percent != last_index_percent || index + 1 == bitmaps.size()) {
                     last_index_percent = index_percent;
@@ -1379,6 +1824,12 @@ namespace nl {
 
             auto process_bitmap = [&](bitmap_job const& job) {
                 bitmap_result result;
+                if (job.imported != nullptr) {
+                    result.compressed.assign(
+                        job.imported, job.imported + job.max_compressed_size);
+                    result.cacheable = false;
+                    return result;
+                }
                 if (cache_enabled) {
                     std::ifstream cache_file(job.cache_path, std::ios::binary | std::ios::ate);
                     if (cache_file) {
@@ -1771,10 +2222,13 @@ namespace nl {
             std::cout << std::endl;
         }
         wztonx(sys::path filename, sys::path cache_root, bool client, bool hc, unsigned threads,
-            sys::path output = {})
-            : client(client), hc(hc), threads(threads) {
+            sys::path output = {}, wz_registry* registry = nullptr, bool check_output = true)
+            : registry(registry), client(client), hc(hc), threads(threads) {
             wzfilename = u8string(filename);
             nxfilename = u8string(output.empty() ? filename.replace_extension(".nx") : output);
+            wz_category = u8string(sys::path{ wzfilename }.stem());
+            auto category_end = wz_category.find_first_of("0123456789_");
+            if (category_end != std::string::npos) wz_category.resize(category_end);
             cache_directory = cache_root / ".NoLifeWzToNx.cache";
             if (!std::ifstream{ wzfilename }.is_open()) {
                 skip = true;
@@ -1782,7 +2236,7 @@ namespace nl {
                     << std::endl;
                 return;
             }
-            if (std::ifstream{ nxfilename }.good()) {
+            if (check_output && std::ifstream{ nxfilename }.good()) {
                 skip = true;
                 std::cout << "Skipping existing output [" << wzfilename << "] -> ["
                     << nxfilename << ']' << std::endl;
@@ -1845,6 +2299,7 @@ Converts WZ files into NX files
     std::cout << std::endl;
     enum { client, server, none } type{ none };
     bool hc{ false };
+    bool info_only{ false };
     std::vector<sys::path> paths;
     sys::path output_directory;
     auto hardware_threads = std::thread::hardware_concurrency();
@@ -1867,6 +2322,7 @@ Converts WZ files into NX files
             type = server;
         }
         else if (arg == "--lz4hc" || arg == "-h") { hc = true; }
+        else if (arg == "--info" || arg == "-i") { info_only = true; }
         else if (arg == "--output") {
             if (++arg_index >= args.size() || args[arg_index].empty()) {
                 std::cerr << "Missing output directory after --output." << std::endl;
@@ -1894,33 +2350,60 @@ Converts WZ files into NX files
         }
     }
 
+    if (info_only && !output_directory.empty()) {
+        std::cerr << "--info cannot be combined with --output." << std::endl;
+        return 1;
+    }
     if (!output_directory.empty() && paths.size() != 1) {
         std::cerr << "--output requires exactly one input file or directory." << std::endl;
         return 1;
     }
-    auto convert = [&](sys::path const& p, sys::path const& cache_root) {
-        auto extension = u8string(p.extension());
+    nl::wz_registry registry;
+    auto lower_extension = [](sys::path const& path) {
+        auto extension = u8string(path.extension());
         std::transform(extension.begin(), extension.end(), extension.begin(),
             [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return extension;
+    };
+    auto output_path_for = [&](sys::path const& input) {
+        if (output_directory.empty()) {
+            auto output = input;
+            return output.replace_extension(".nx");
+        }
+        auto relative = sys::is_directory(paths.front())
+            ? input.lexically_relative(paths.front()) : input.filename();
+        return output_directory / relative.replace_extension(".nx");
+    };
+    auto failed = false;
+    auto convert = [&](sys::path const& p, sys::path const& cache_root) {
+        auto extension = lower_extension(p);
         if (extension != ".img" && extension != ".wz") return;
         sys::path output;
         if (!output_directory.empty()) {
-            auto relative = sys::is_directory(paths.front())
-                ? p.lexically_relative(paths.front()) : p.filename();
-            output = output_directory / relative.replace_extension(".nx");
+            output = output_path_for(p);
             sys::create_directories(output.parent_path());
         }
-        if (extension == ".img") {
-            nl::imgtonx{ p, cache_root, type == client, hc, threads, output }.convert_file();
+        try {
+            if (extension == ".img") {
+                nl::imgtonx{ p, cache_root, type == client, hc, threads, output }.convert_file();
+            }
+            else {
+                nl::wztonx{
+                    p, cache_root, type == client, hc, threads, output, &registry }.convert_file();
+            }
         }
-        else {
-            nl::wztonx{ p, cache_root, type == client, hc, threads, output }.convert_file();
+        catch (std::exception const& error) {
+            failed = true;
+            std::cerr << "Error converting [" << u8string(p) << "]: "
+                << error.what() << std::endl;
         }
     };
 
+    std::vector<std::pair<sys::path, sys::path>> files;
     for (auto& p : paths) {
-        if (sys::is_regular_file(p)) { convert(p, p.parent_path()); }
+        if (sys::is_regular_file(p)) { files.emplace_back(p, p.parent_path()); }
         else if (sys::is_directory(p)) {
+          std::vector<sys::path> directory_files;
           for (sys::recursive_directory_iterator it{p}, end{}; it != end;
                ++it) {
             if (it->is_directory()) {
@@ -1928,13 +2411,56 @@ Converts WZ files into NX files
                     it.disable_recursion_pending();
                 continue;
             }
-            if (it->is_regular_file()) convert(it->path(), p);
+            if (it->is_regular_file()) directory_files.push_back(it->path());
           }
+          std::sort(directory_files.begin(), directory_files.end());
+          for (auto const& file : directory_files) files.emplace_back(file, p);
         }
     }
+    if (info_only) {
+        for (auto const& file : files) {
+            if (lower_extension(file.first) != ".wz") continue;
+            try {
+                nl::wztonx{
+                    file.first, file.second, false, false, threads }.detect_version();
+            }
+            catch (std::exception const& error) {
+                failed = true;
+                std::cerr << "Error reading [" << u8string(file.first) << "]: "
+                    << error.what() << std::endl;
+            }
+        }
+        return failed ? 1 : 0;
+    }
+    auto needs_wz_conversion = std::any_of(files.begin(), files.end(), [&](auto const& file) {
+        return lower_extension(file.first) == ".wz"
+            && !sys::is_regular_file(output_path_for(file.first));
+        });
+    if (type == client && needs_wz_conversion) {
+        std::cout << "Building WZ registry..." << std::endl;
+        for (auto const& file : files) {
+            if (lower_extension(file.first) != ".wz") continue;
+            std::cout << "Indexing WZ [" << u8string(file.first) << "]..." << std::flush;
+            try {
+                nl::wztonx scanner{
+                    file.first, file.second, true, hc, threads, {}, &registry, false };
+                auto count = scanner.index_registry(registry);
+                std::cout << count << " bitmap(s)." << std::endl;
+            }
+            catch (std::exception const& error) {
+                failed = true;
+                std::cerr << "Error indexing [" << u8string(file.first) << "]: "
+                    << error.what() << std::endl;
+            }
+        }
+        std::cout << "WZ registry ready: " << registry.bitmaps.size()
+            << " bitmap path(s)." << std::endl;
+    }
+    for (auto const& file : files) convert(file.first, file.second);
     auto b = std::chrono::high_resolution_clock::now();
     std::cout << "Took " << std::dec
         << std::chrono::duration_cast<std::chrono::seconds>(b - a).count() << " seconds"
         << std::endl;
     std::cout.rdbuf(old);
+    return failed ? 1 : 0;
 }
