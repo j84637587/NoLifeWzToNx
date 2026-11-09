@@ -114,6 +114,35 @@ At least one input file or directory must be provided. The converter writes each
 
 Client bitmap compression results are cached in a shared `.NoLifeWzToNx.cache` directory. For a directory input, one cache is created at the specified root and shared by all recursively converted WZ/IMG files; for a single-file input, the cache is created next to that file. Unchanged bitmaps are reused even when the input filename changes. The bitmap progress line shows the completed count, percentage, cache hits, and images compressed during the current run. A changed bitmap, compression mode, or bitmap format automatically uses a separate cache entry.
 
+## Daily conversion: keep only two NX generations
+
+After building the updated converter, put only your active WZ/IMG set in `wz/current/` and double-click `convert-local.bat` (Windows PowerShell 5.1+).
+
+```text
+wz/current/          active WZ/IMG files, with stable filenames
+wz/backup/           manually managed source backup, excluded from conversion
+nx-local/current/    latest successful NX set
+nx-local/previous/   previous distinct successful NX set
+```
+
+- Conversion first writes temporary NX output. A successful exit, complete expected file set, basic PKG4 headers and unchanged source/converter hashes are required before promotion. This is not in-game compatibility validation.
+- A failed conversion leaves both successful generations intact. The next successful distinct generation rotates out the oldest NX set; identical output does not consume history.
+- Source WZ/IMG files are never deleted or automatically backed up. Save a pre-edit copy in `wz/backup/` yourself.
+- Existing numbered history is not migrated or cleaned. Do not use a folder containing multiple historical WZ versions as the active source.
+- Interrupted rotation is recovered on the next run. Locked or unexpected files stop cleanup rather than being forcibly removed. Keep `nx-local/` exclusively for the tool's managed NX output.
+- Use `nx-local/current/` for client testing, or retrieve `previous/` to roll back. The script does not switch a client or publish assets.
+- The shared source-side `.NoLifeWzToNx.cache` is unchanged and is not pruned by this workflow.
+
+For an existing active source folder:
+
+```powershell
+.\convert-local.ps1 -Source 'F:\NovaAssets\wz-current'
+```
+
+Optional parameters: `-Output`, `-ConverterPath`, `-Mode server`, `-Threads 8`, `-Lz4HC`. The output must be empty on first use; source and output must not contain each other.
+
+The converter also supports `--output DIR` for exactly one input file or directory, preserving relative paths. Omitting it retains the existing source-adjacent output and skip-existing behavior. Use `convert-local` for retention and failure protection.
+
 ## NX raw binary extension
 
 WZ `RawData` and `Canvas#Video` payloads are copied byte-for-byte into the NX file, including payloads with child properties or zero length. They are available in both client and server output.
