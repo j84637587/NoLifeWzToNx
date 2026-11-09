@@ -1,4 +1,5 @@
 #include "SoundFontPayload.h"
+#include "PackedCanvasEncoder.h"
 //////////////////////////////////////////////////////////////////////////////////
 //	This file is part of the continued NoLifeStory project						//
 //	Copyright (C) 2014-2020  Peter Atashian, Ryan Payton						//
@@ -361,10 +362,12 @@ namespace nl {
     struct bitmap {
         uint64_t data;
         uint8_t const* key;
+        bool packed = false;
     };
     struct raw_binary {
         uint32_t length;
         uint64_t data;
+        std::vector<uint8_t> owned;
     };
     // The main class itself
     struct wztonx {
@@ -719,7 +722,7 @@ namespace nl {
         }
         void extended_property(id_t prop_node, size_t p_offset, size_t property_end = 0) {
             auto& n = nodes[prop_node];
-            auto& st = strings[read_prop_string(p_offset)];
+            const auto st = strings[read_prop_string(p_offset)];
             if (st == "Property") {
                 in.skip(2);
                 sub_property(prop_node, p_offset);
@@ -738,6 +741,7 @@ namespace nl {
                 bitmaps.push_back({ in.tell(), reinterpret_cast<uint8_t const*>(u8key) });
                 nn.data.bitmap.width = static_cast<uint16_t>(in.read_cint());
                 nn.data.bitmap.height = static_cast<uint16_t>(in.read_cint());
+                preserve_packed_canvas(prop_node, property_end);
             }
             else if (st == "Shape2D#Vector2D") {
                 n.data_type = node::type::vector;
@@ -847,6 +851,71 @@ namespace nl {
             }
             else { throw std::runtime_error("Unknown sub property type: " + st); }
         }
+        void preserve_packed_canvas(id_t prop_node, size_t property_end) {
+            if (!client) return;
+            const auto saved = in.tell();
+            const auto bitmap_id = nodes[prop_node].data.bitmap.id;
+            const auto end = property_end ? property_end : current_image_end;
+            auto available = [&](size_t size) {
+                if (in.tell() > end || size > end - in.tell())
+                    throw std::runtime_error("Packed canvas exceeds its property");
+            };
+            auto cint = [&]() -> int32_t {
+                available(1);
+                const auto value = in.read<int8_t>();
+                if (value != -128) return value;
+                available(4);
+                return in.read<int32_t>();
+            };
+            in.seek(bitmaps[bitmap_id].data);
+            const auto width = cint();
+            const auto height = cint();
+            // format2 is a compressed integer, not always a single byte.
+            const auto format1 = cint();
+            const auto format2 = cint();
+            if (int64_t(format1) + int64_t(format2) * 256 != nx_texture::kFormat) {
+                in.seek(saved);
+                return;
+            }
+            if (width <= 0 || height <= 0 || width > 65535 || height > 65535)
+                throw std::runtime_error("Invalid packed canvas dimensions");
+            available(9);
+            const auto stored_pages = in.read<uint32_t>();
+            const auto length = in.read<uint32_t>();
+            const auto marker = in.read<uint8_t>();
+            if (!length || marker != 0)
+                throw std::runtime_error("Invalid packed canvas pixel length or marker");
+            available(length - 1);
+            auto payload = nx_texture::encode(
+                reinterpret_cast<const uint8_t*>(in.base + in.tell()), length - 1,
+                bitmaps[bitmap_id].key, width, height, stored_pages ? stored_pages : 1);
+            if (raw_binaries.size() >= UINT32_MAX)
+                throw std::runtime_error("NX raw binary table is too large");
+            const auto count = nodes[prop_node].num;
+            const auto old_children = nodes[prop_node].children;
+            if (count == UINT16_MAX)
+                throw std::runtime_error("Packed canvas has too many child properties");
+            for (uint16_t i = 0; i < count; ++i)
+                if (strings[nodes[old_children + i].name] == nx_texture::kNodeName)
+                    throw std::runtime_error("Reserved packed canvas child already exists");
+            std::vector<node> children;
+            for (uint16_t i = 0; i < count; ++i) children.push_back(nodes[old_children + i]);
+            node precise;
+            precise.name = add_string(std::string(nx_texture::kNodeName));
+            precise.data_type = node::type::raw;
+            precise.data.raw.id = static_cast<uint32_t>(raw_binaries.size());
+            precise.data.raw.length = static_cast<uint32_t>(payload.size());
+            raw_binaries.push_back({precise.data.raw.length, 0, std::move(payload)});
+            children.push_back(precise);
+            const auto first = static_cast<id_t>(nodes.size());
+            nodes.insert(nodes.end(), children.begin(), children.end());
+            nodes[prop_node].children = first;
+            nodes[prop_node].num = static_cast<uint16_t>(count + 1);
+            nodes_to_sort.emplace_back(first, count + 1);
+            bitmaps[bitmap_id].packed = true;
+            in.seek(saved);
+        }
+
         void sub_property(id_t prop_node, size_t p_offset) {
             auto& n = nodes[prop_node];
             auto count = static_cast<id_t>(in.read_cint());
@@ -1143,8 +1212,10 @@ namespace nl {
                 raw_data_offset += raw.length;
             }
             out.seek(raw_offset);
-            for (auto const& raw : raw_binaries)
-                out.write(in.base + raw.data, raw.length);
+            for (auto const& raw : raw_binaries) {
+                if (raw.owned.empty()) out.write(in.base + raw.data, raw.length);
+                else out.write(raw.owned.data(), raw.length);
+            }
             std::cout << "Done!" << std::endl;
         }
         void write_audio() {
@@ -1208,9 +1279,9 @@ namespace nl {
                     throw std::runtime_error{ "Bitmap is too large" };
                 }
                 auto format1 = in.read_cint();
-                auto format2 = static_cast<unsigned>(in.read<uint8_t>());
+                auto format2 = static_cast<unsigned>(in.read_cint());
                 auto n1 = in.read<uint32_t>();
-                if (n1) {
+                if (n1 && !b.packed) {
                     std::cout << "non-zero n1: "
                         << "0x" << std::setfill('0') << std::setw(8) << std::hex << n1;
                     throw std::runtime_error{ "Invalid bitmap header" };
