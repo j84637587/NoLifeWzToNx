@@ -26,7 +26,7 @@ def properties(items):
 def extended(data):
     return struct.pack('<I', len(data)) + data
 
-def canvas(raw, pages=1, fmt=2562, encrypted=False, child_name='origin', declared=None, fmt2=0, legacy=False, link=None, origin=(7, 9), extra_items=()):
+def canvas(raw, pages=1, fmt=2562, encrypted=False, child_name='origin', declared=None, fmt2=0, legacy=False, legacy_invalid_block=False, truncated_trailer=False, link=None, origin=(7, 9), extra_items=()):
     origin = b'\x73' + ws('Shape2D#Vector2D') + ci(origin[0]) + ci(origin[1])
     items = [(child_name, 9, extended(origin))]
     if link: items.append((link, 8, b'\0' + ws('atlas')))
@@ -34,7 +34,11 @@ def canvas(raw, pages=1, fmt=2562, encrypted=False, child_name='origin', declare
     compressed = zlib.compress(raw)
     if legacy:
         stream = zlib.compressobj()
-        compressed = stream.compress(raw) + stream.flush(zlib.Z_SYNC_FLUSH) + b'\x07'
+        compressed = stream.compress(raw) + stream.flush(zlib.Z_SYNC_FLUSH)
+        if legacy_invalid_block:
+            compressed += b'\x07'
+    if truncated_trailer:
+        compressed = compressed[:-4]
     if encrypted:
         blocks = [compressed[i:i + 13] for i in range(0, len(compressed), 13)]
         compressed = b''.join(struct.pack('<I', len(b)) + bytes(x ^ KEY[i] for i, x in enumerate(b)) for b in blocks)
@@ -108,18 +112,27 @@ with tempfile.TemporaryDirectory() as folder:
         result = subprocess.run([BINARY, str(p), '-c', '--threads', '1'], capture_output=True)
         assert (result.returncode == 0) == ok, (name, result.stdout, result.stderr)
         return p.with_suffix('.nx')
-    for pages in [0, 1, 2, 20]:
-        raw = b''.join(struct.pack('<I', (i * 101 + 3) & 0xffffffff) for i in range(16 * max(1, pages)))
+    for pages in [1, 2, 20]:
+        raw = b''.join(struct.pack('<I', (i * 101 + 3) & 0xffffffff) for i in range(16 * pages))
         assert read(run('pages' + str(pages), image(canvas(raw, pages)))) == raw
+    for pages in [1, 2, 19, 20]:
+        raw = b''.join(struct.pack('<I', (i * 101 + 3) & 0xffffffff) for i in range(16 * pages))
+        assert read(run('inferred-pages' + str(pages), image(canvas(raw, 0)))) == raw
     raw = b''.join(struct.pack('<I', i * 1023 + 1) for i in range(32))
     assert read(run('split-format', image(canvas(raw, 2, fmt=2, fmt2=10)))) == raw
     assert read(run('legacy-complete', image(canvas(raw, 2, legacy=True)))) == raw
+    assert read(run('legacy-invalid-block', image(canvas(raw, 2, legacy=True, legacy_invalid_block=True)))) == raw
     assert read(run('list-bms', image(canvas(raw, 2, encrypted=True)))) == raw
+    assert read(run('list-bms-inferred', image(canvas(raw, 0, encrypted=True)))) == raw
     keys = pathlib.Path(__file__).resolve().parents[1].joinpath('Keys.cpp').read_text()
     section = keys.split('key_gms[65536] = {', 1)[1].split('};', 1)[0]
     KEY = bytes(int(x, 16) for x in re.findall(r'0x([0-9a-fA-F]{2})', section))
     assert read(run('list-gms', image(canvas(raw, 2, encrypted=True)))) == raw
     KEY = bytes(65536)
+    run('inferred-partial-page', image(canvas(bytes(65), 0)), False)
+    run('inferred-too-many-pages', image(canvas(bytes(64 * 65537), 0)), False)
+    run('complete-page-truncated-trailer', image(canvas(bytes(64), 0, truncated_trailer=True)), False)
+    run('declared-page-truncated-trailer', image(canvas(bytes(64), 1, truncated_trailer=True)), False)
     assert read(run('ordinary', image(canvas(bytes(64), 0, 2)))) is None
     for link in ['source', '_inlink', '_outlink']:
         items = [('atlas', 9, extended(canvas(raw, 2))),
@@ -152,4 +165,4 @@ with tempfile.TemporaryDirectory() as folder:
     run('truncated', image(canvas(bytes(128), 2))[:-1], False)
     run('bad-length', image(canvas(bytes(64), declared=100000)), False)
     run('collision', image(canvas(bytes(64), child_name='__nx_texture')), False)
-print('PASS actual converter: 10-bit bits, 1/2/20 pages, origin, BMS/GMS encrypted blocks, legacy and malformed data')
+print('PASS actual converter: packed pages, inferred 1/2/19/20 pages, origin, BMS/GMS encrypted blocks, legacy and malformed data')

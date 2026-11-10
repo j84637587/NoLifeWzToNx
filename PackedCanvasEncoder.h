@@ -4,13 +4,67 @@
 #include <zlib.h>
 
 namespace nx_texture {
+inline bool hasLegacyZlibTail(const uint8_t* data, size_t length) {
+  static constexpr uint8_t sync_flush[] = {0x00, 0x00, 0xff, 0xff};
+  if (length >= sizeof(sync_flush) &&
+      std::memcmp(data + length - sizeof(sync_flush), sync_flush,
+                  sizeof(sync_flush)) == 0)
+    return true;
+  // Some existing WZ samples append an invalid deflate block after Z_SYNC_FLUSH.
+  return length >= sizeof(sync_flush) + 1 && data[length - 1] == 0x07 &&
+      std::memcmp(data + length - sizeof(sync_flush) - 1, sync_flush,
+                  sizeof(sync_flush)) == 0;
+}
+
+inline uint32_t inferPageCount(const uint8_t* data, size_t length,
+    uint64_t page_bytes) {
+  z_stream stream{};
+  if (inflateInit(&stream) != Z_OK)
+    throw std::runtime_error("Cannot initialize packed canvas inflater");
+  struct Cleanup { z_stream* stream; ~Cleanup() { inflateEnd(stream); } } cleanup{&stream};
+  stream.next_in = const_cast<Bytef*>(data);
+  stream.avail_in = static_cast<uInt>(length);
+  uint8_t output[64 * 1024];
+  const auto max_bytes = page_bytes * kMaxPages;
+  uint64_t total = 0;
+  while (true) {
+    stream.next_out = output;
+    stream.avail_out = sizeof(output);
+    const auto before_in = stream.avail_in;
+    const auto status = inflate(&stream, Z_NO_FLUSH);
+    const auto produced = sizeof(output) - stream.avail_out;
+    if (produced > max_bytes - total)
+      throw std::runtime_error("Packed canvas page count exceeds limit");
+    total += produced;
+    if (status == Z_STREAM_END) {
+      if (stream.avail_in != 0)
+        throw std::runtime_error("Packed canvas has trailing compressed data");
+      break;
+    }
+    const bool legacy_end = stream.avail_in == 0 && hasLegacyZlibTail(data, length) &&
+        (status == Z_BUF_ERROR || (status == Z_DATA_ERROR && stream.msg &&
+         std::strcmp(stream.msg, "invalid block type") == 0));
+    if (legacy_end) break;
+    if (status != Z_OK ||
+        (before_in == stream.avail_in && produced == 0))
+      throw std::runtime_error("Invalid packed canvas zlib stream");
+  }
+  if (!total || total % page_bytes != 0)
+    throw std::runtime_error("Packed canvas size is not a whole page count");
+  const auto pages = total / page_bytes;
+  if (!pages || pages > kMaxPages)
+    throw std::runtime_error("Packed canvas page count exceeds limit");
+  return static_cast<uint32_t>(pages);
+}
+
 inline std::vector<uint8_t> encodePages(const uint8_t* data, size_t length,
     uint32_t width, uint32_t height, uint32_t pages) {
   const uint64_t bytes = uint64_t(width) * height * 4;
-  if (!data || !width || !height || width > 65535 || height > 65535 || !pages ||
+  if (!data || !width || !height || width > 65535 || height > 65535 ||
       pages > kMaxPages || bytes > static_cast<uint64_t>(LZ4_MAX_INPUT_SIZE) ||
       !length || length > (std::numeric_limits<uInt>::max)())
     throw std::runtime_error("Invalid packed canvas source dimensions");
+  if (!pages) pages = inferPageCount(data, length, bytes);
   z_stream stream{};
   if (inflateInit(&stream) != Z_OK)
     throw std::runtime_error("Cannot initialize packed canvas inflater");
@@ -40,7 +94,8 @@ inline std::vector<uint8_t> encodePages(const uint8_t* data, size_t length,
       status = inflate(&stream, Z_NO_FLUSH);
       if (status == Z_DATA_ERROR && index + 1 == pages &&
           stream.avail_out == 0 && stream.avail_in == 0 && stream.msg &&
-          std::strcmp(stream.msg, "invalid block type") == 0) {
+          std::strcmp(stream.msg, "invalid block type") == 0 &&
+          hasLegacyZlibTail(data, length)) {
         legacy_complete = true;
         break;
       }
@@ -67,10 +122,11 @@ inline std::vector<uint8_t> encodePages(const uint8_t* data, size_t length,
   stream.next_out = &extra;
   stream.avail_out = 1;
   const auto status = inflate(&stream, Z_FINISH);
-  const bool legacy_tail = status == Z_DATA_ERROR && stream.msg &&
-      std::strcmp(stream.msg, "invalid block type") == 0;
+  const bool legacy_tail = hasLegacyZlibTail(data, length) &&
+      (status == Z_BUF_ERROR || (status == Z_DATA_ERROR && stream.msg &&
+       std::strcmp(stream.msg, "invalid block type") == 0));
   if (stream.avail_out != 1 || stream.avail_in != 0 ||
-      (status != Z_STREAM_END && status != Z_BUF_ERROR && !legacy_tail))
+      (status != Z_STREAM_END && !legacy_tail))
     throw std::runtime_error("Packed canvas size does not match page count");
   return result;
 }
