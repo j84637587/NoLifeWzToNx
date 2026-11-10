@@ -1175,7 +1175,7 @@ namespace nl {
             if (width <= 0 || height <= 0 || width > 65535 || height > 65535)
                 throw std::runtime_error("Invalid packed canvas dimensions");
             available(9);
-            const auto stored_pages = bitmap_input.read<uint32_t>();
+            const auto n1 = bitmap_input.read<uint32_t>();
             const auto length = bitmap_input.read<uint32_t>();
             const auto marker = bitmap_input.read<uint8_t>();
             if (!length || marker != 0)
@@ -1183,7 +1183,7 @@ namespace nl {
             available(length - 1);
             auto payload = nx_texture::encode(
                 reinterpret_cast<const uint8_t*>(bitmap_input.base + bitmap_input.tell()),
-                length - 1, bitmap.key, width, height, stored_pages ? stored_pages : 1);
+                length - 1, bitmap.key, width, height, n1);
             if (raw_binaries.size() >= UINT32_MAX)
                 throw std::runtime_error("NX raw binary table is too large");
             const auto raw_id = static_cast<uint32_t>(raw_binaries.size());
