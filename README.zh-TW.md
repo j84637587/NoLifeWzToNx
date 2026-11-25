@@ -136,7 +136,7 @@ nx-local/
   previous/          # 上一套不同內容的成功 NX
 ```
 
-- 每次先產生暫存 NX, 全部完成且通過檔案數量、PKG4/PKG5 header 與來源雜湊檢查後才換版。
+- 每次先產生暫存 NX, 全部完成且通過檔案數量, PKG4/PKG5 header 與來源雜湊檢查後才換版.
 - 失敗不替換目前版或上一版; 來源轉換途中變更也會拒絕換版。這是基本輸出檢查, 不代表遊戲內相容性驗證。
 - 第三套不同內容轉換成功後, 自動移除更舊的 NX; 相同內容不消耗上一版。
 - 來源 WZ/IMG 不會被刪除或自動備份。修改前自行備份到 `wz/backup/`, 確認新版本沒問題後再更新備份。
@@ -158,7 +158,7 @@ nx-local/
 
 ## 大型字串格式
 
-字串長度不超過 65535 bytes 時輸出 PKG4, 每筆字串以 2-byte 長度開頭。只要檔內有更長的字串, 整檔改用 PKG5, 每筆字串以 4-byte 長度開頭; 其他 header、node 和 payload 佈局相同。PKG5 需要支援此格式的 Client NoLifeNx 讀取器, 因此必須先更新 Client, 再部署新產生的 NX。舊版 Client 無法讀取 PKG5。
+字串長度不超過 65535 bytes 時輸出 PKG4, 每筆字串以 2-byte 長度開頭. 只要檔內有更長的字串, 整檔改用 PKG5, 每筆字串以 4-byte 長度開頭; 其他 header, node 和 payload 佈局相同. PKG5 需要支援此格式的 Client NoLifeNx 讀取器, 因此必須先更新 Client, 再部署新產生的 NX. 舊版 Client 無法讀取 PKG5.
 
 ## NX raw binary 擴充
 

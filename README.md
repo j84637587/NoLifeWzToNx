@@ -134,7 +134,7 @@ nx-local/current/    latest successful NX set
 nx-local/previous/   previous distinct successful NX set
 ```
 
-- Conversion first writes temporary NX output. A successful exit, complete expected file set, basic PKG4 headers and unchanged source/converter hashes are required before promotion. This is not in-game compatibility validation.
+- 轉換會先寫入暫存 NX. 成功結束, 預期檔案齊全, PKG4/PKG5 header 正確, 且來源與轉換器雜湊未變更後才換版; 這不代表遊戲內相容性驗證.
 - A failed conversion leaves both successful generations intact. The next successful distinct generation rotates out the oldest NX set; identical output does not consume history.
 - Source WZ/IMG files are never deleted or automatically backed up. Save a pre-edit copy in `wz/backup/` yourself.
 - Existing numbered history is not migrated or cleaned. Do not use a folder containing multiple historical WZ versions as the active source.
@@ -156,7 +156,7 @@ The converter also supports `--output DIR` for exactly one input file or directo
 
 WZ `RawData` and `Canvas#Video` payloads are copied byte-for-byte into the NX file, including payloads with child properties or zero length. They are available in both client and server output.
 
-The extension keeps the `PKG4` header and the existing 20-byte node layout. Header offset 52 stores the raw entry count as a `uint32`, and offset 56 stores the raw offset-table position as a `uint64`. Node type 8 is raw binary; its 8-byte data field contains the raw entry ID and payload length as two `uint32` values. Each raw offset-table entry is a `uint64` absolute file offset. Files without raw entries retain zeroes in header bytes 52 through 63.
+此擴充維持 `PKG4`/`PKG5` header 與既有 20-byte node 佈局. Header offset 52 存放 raw entry 數量 (`uint32`), offset 56 存放 raw offset table 位置 (`uint64`). Node type 8 代表 raw binary, 其 8-byte data field 依序存放 raw entry ID 與 payload length (皆為 `uint32`); raw offset table 每筆資料為 payload 的絕對位置 (`uint64`). 沒有 raw entry 時, header byte 52 至 63 維持全零.
 
 ## Dependencies
 
