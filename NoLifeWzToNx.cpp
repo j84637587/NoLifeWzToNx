@@ -398,6 +398,7 @@ namespace nl {
         uint64_t string_table_offset = 0;
         uint32_t bitmap_count = 0;
         uint64_t bitmap_table_offset = 0;
+        bool wide_strings = false;
 
         template <typename T>
         T read_at(uint64_t position) const {
@@ -410,8 +411,10 @@ namespace nl {
 
         explicit nxfile(std::string const& filename) {
             in.open(filename);
-            if (read_at<uint32_t>(0) != 0x34474B50)
+            auto magic = read_at<uint32_t>(0);
+            if (magic != 0x34474B50 && magic != 0x35474B50)
                 throw std::runtime_error("Invalid NX header in " + filename);
+            wide_strings = magic == 0x35474B50;
             node_count = read_at<uint32_t>(4);
             node_offset = read_at<uint64_t>(8);
             string_count = read_at<uint32_t>(16);
@@ -439,8 +442,9 @@ namespace nl {
             if (id >= string_count) throw std::runtime_error("Invalid NX string id");
             auto position = read_at<uint64_t>(
                 string_table_offset + static_cast<uint64_t>(id) * sizeof(uint64_t));
-            auto length = read_at<uint16_t>(position);
-            position += sizeof(uint16_t);
+            auto length = wide_strings ? read_at<uint32_t>(position)
+                : read_at<uint16_t>(position);
+            position += wide_strings ? sizeof(uint32_t) : sizeof(uint16_t);
             if (position > in.file_size || length > in.file_size - position)
                 throw std::runtime_error("Invalid NX string");
             return std::string(in.base + position, length);
@@ -589,6 +593,7 @@ namespace nl {
         unsigned threads;
         bool skip = false;
         bool index_only = false;
+        bool wide_strings = false;
         // Methods
         std::string convert_str(std::u16string const& p_str) {
 #ifndef NL_NO_CODECVT
@@ -1556,6 +1561,11 @@ namespace nl {
             attach_packed_canvases();
         }
         void calculate_offsets() {
+            wide_strings = std::any_of(strings.begin(), strings.end(),
+                [](std::string const& s) { return s.size() > UINT16_MAX; });
+            if (std::any_of(strings.begin(), strings.end(),
+                [](std::string const& s) { return s.size() > UINT32_MAX; }))
+                throw std::runtime_error("NX string is too large");
             offset = 0;
             offset += 52;
             offset += 0x10 - (offset & 0xf);
@@ -1567,8 +1577,9 @@ namespace nl {
             offset += 0x10 - (offset & 0xf);
             string_offset = offset;
             offset += std::accumulate(strings.begin(), strings.end(), 0ull,
-                [](size_t n, std::string const& s) {
-                    return n + s.size() + 2 + (s.size() & 1 ? 1 : 0);
+                [this](size_t n, std::string const& s) {
+                    return n + s.size() + (wide_strings ? 4 : 2)
+                        + (s.size() & 1 ? 1 : 0);
                 });
             offset += 0x10 - (offset & 0xf);
             audio_table_offset = offset;
@@ -1609,7 +1620,7 @@ namespace nl {
             calculate_offsets();
             out.open(nxfilename, offset);
             out.seek(0);
-            out.write<uint32_t>(0x34474B50);
+            out.write<uint32_t>(wide_strings ? 0x35474B50 : 0x34474B50);
             out.write<uint32_t>(static_cast<uint32_t>(nodes.size()));
             out.write<uint64_t>(node_offset);
             out.write<uint32_t>(static_cast<uint32_t>(strings.size()));
@@ -1642,12 +1653,15 @@ namespace nl {
             auto next_str = string_offset;
             for (auto const& s : strings) {
                 out.write<uint64_t>(next_str);
-                next_str += s.size() + 2;
+                next_str += s.size() + (wide_strings ? 4 : 2);
                 if (s.size() & 1) ++next_str;
             }
             out.seek(string_offset);
             for (auto const& s : strings) {
-                out.write<uint16_t>(static_cast<uint16_t>(s.size()));
+                if (wide_strings) {
+                    out.write<uint32_t>(static_cast<uint32_t>(s.size()));
+                }
+                else out.write<uint16_t>(static_cast<uint16_t>(s.size()));
                 out.write(s.data(), s.size());
                 if (s.size() & 1) out.skip(1);
             }
