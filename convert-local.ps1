@@ -68,7 +68,7 @@ function Get-Outputs([string]$Directory, [object[]]$Inputs) {
         try {
             $magic = New-Object byte[] 4
             if ($stream.Read($magic, 0, 4) -ne 4 -or
-                [Text.Encoding]::ASCII.GetString($magic) -cne 'PKG4') {
+                [Text.Encoding]::ASCII.GetString($magic) -cnotin @('PKG4', 'PKG5')) {
                 throw "Invalid NX header: $path"
             }
         } finally { $stream.Dispose() }
